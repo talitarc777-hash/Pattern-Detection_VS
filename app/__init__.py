@@ -1,0 +1,2 @@
+"""Pattern detection application package."""
+
