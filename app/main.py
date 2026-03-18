@@ -20,10 +20,10 @@ class PatternDetectionApp:
         self.template_var = StringVar()
         self.output_var = StringVar(value=str((Path.cwd() / "outputs").resolve()))
 
-        self.threshold_var = StringVar(value="0.58")
+        self.threshold_var = StringVar(value="0.50")
         self.dpi_var = StringVar(value="220")
-        self.min_scale_var = StringVar(value="0.5")
-        self.max_scale_var = StringVar(value="4.0")
+        self.min_scale_var = StringVar(value="0.35")
+        self.max_scale_var = StringVar(value="8.0")
         self.dark_threshold_var = StringVar(value="0")
 
         self._build_ui()
@@ -187,10 +187,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--input", type=Path, help="Input file (.png/.jpg/.jpeg/.pdf)")
     parser.add_argument("--template", type=Path, help="Template image of the markup symbol")
     parser.add_argument("--output", type=Path, default=Path("outputs"), help="Output folder")
-    parser.add_argument("--threshold", type=float, default=0.58, help="Match threshold")
+    parser.add_argument("--threshold", type=float, default=0.50, help="Match threshold")
     parser.add_argument("--dpi", type=int, default=220, help="PDF rendering DPI")
-    parser.add_argument("--min-scale", type=float, default=0.5, help="Minimum template scale")
-    parser.add_argument("--max-scale", type=float, default=4.0, help="Maximum template scale")
+    parser.add_argument("--min-scale", type=float, default=0.35, help="Minimum template scale")
+    parser.add_argument("--max-scale", type=float, default=8.0, help="Maximum template scale")
     parser.add_argument("--dark-threshold", type=int, default=0, help="Dark pixel threshold (0=auto)")
     return parser.parse_args(argv)
 

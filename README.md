@@ -22,18 +22,18 @@ The app outputs:
 
 ## Notes on low-quality files
 
-The detector is tuned for noisy/blurred drawings by matching the black symbol geometry from the template:
-- left straight stroke + right reversed-L stroke
-- connected-component pairing with template-shape scoring
-- adaptive contrast extraction (color-tolerant, not black-only)
+The detector is tuned for noisy/blurred drawings by matching the template shape itself:
+- supports connected symbols and split/multi-part symbols
+- template-driven mask shape scoring instead of black-only assumptions
+- adaptive contrast extraction and background-distance extraction for poor-quality images
 - scale filtering + duplicate suppression (NMS)
 
 If counts are too high (false positives):
-- increase `Match threshold` (for example `0.58` to `0.70`)
+- increase `Match threshold` (for example `0.50` to `0.65`)
 - lower `Dark threshold` only if you are using manual value (for example `110` to `90`)
 
 If counts are too low (missed detections):
-- decrease `Match threshold` (for example `0.58` to `0.50`)
+- decrease `Match threshold` (for example `0.50` to `0.42`)
 - increase `Dark threshold` only if needed (for example `90` to `115`) or keep `0` for auto
 - widen scale range (increase `Max scale`)
 
