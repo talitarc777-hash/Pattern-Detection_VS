@@ -12,15 +12,15 @@ import numpy as np
 @dataclass(frozen=True)
 class DetectionConfig:
     dpi: int = 220
-    match_threshold: float = 0.60
-    min_scale: float = 0.8
-    max_scale: float = 3.5
-    dark_threshold: int = 90
+    match_threshold: float = 0.58
+    min_scale: float = 0.5
+    max_scale: float = 4.0
+    dark_threshold: int = 0  # 0 means auto
     nms_iou_threshold: float = 0.2
     max_detection_dim: int = 1700
     min_component_area: int = 3
-    max_component_area: int = 420
-    max_component_width: int = 16
+    max_component_area: int = 140
+    max_component_width: int = 12
     min_component_height: int = 3
 
 
@@ -60,6 +60,7 @@ class _Component:
     area: int
     cx: float
     cy: float
+    hu: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -68,13 +69,13 @@ class _TemplateModel:
     left_w: float
     left_h: float
     left_a: float
-    left_cx: float
     left_cy: float
+    left_hu: tuple[float, ...]
     right_w: float
     right_h: float
     right_a: float
-    right_cx: float
     right_cy: float
+    right_hu: tuple[float, ...]
     dx: float
     dy: float
     aspect_ratio: float
@@ -146,14 +147,11 @@ def detect_document(
 
 
 def _build_template_model(template_bgr: np.ndarray) -> _TemplateModel:
-    gray = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2GRAY)
-    binary = _template_binary(gray)
+    binary = _foreground_binary(template_bgr, dark_threshold=0, for_template=True)
     components = _components_from_binary(binary, min_area=2)
-
     if len(components) < 2:
-        raise ValueError("Template must contain the target symbol with 2 dark parts.")
+        raise ValueError("Template must contain the target symbol with 2 visible strokes.")
 
-    # Keep two strongest parts and sort left-to-right.
     components = sorted(components, key=lambda c: c.area, reverse=True)[:2]
     components = sorted(components, key=lambda c: c.cx)
     left, right = components[0], components[1]
@@ -166,8 +164,8 @@ def _build_template_model(template_bgr: np.ndarray) -> _TemplateModel:
     width = float(max(1, x1 - x0))
 
     left_cx = (left.cx - x0) / height
-    left_cy = (left.cy - y0) / height
     right_cx = (right.cx - x0) / height
+    left_cy = (left.cy - y0) / height
     right_cy = (right.cy - y0) / height
 
     return _TemplateModel(
@@ -175,61 +173,37 @@ def _build_template_model(template_bgr: np.ndarray) -> _TemplateModel:
         left_w=float(left.w) / height,
         left_h=float(left.h) / height,
         left_a=float(left.area) / (height * height),
-        left_cx=left_cx,
         left_cy=left_cy,
+        left_hu=left.hu,
         right_w=float(right.w) / height,
         right_h=float(right.h) / height,
         right_a=float(right.area) / (height * height),
-        right_cx=right_cx,
         right_cy=right_cy,
+        right_hu=right.hu,
         dx=right_cx - left_cx,
         dy=abs(right_cy - left_cy),
         aspect_ratio=width / height,
     )
 
 
-def _template_binary(gray: np.ndarray) -> np.ndarray:
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    if np.count_nonzero(binary) < 8:
-        binary = np.where(gray < 245, 255, 0).astype(np.uint8)
-    return binary
-
-
-def _components_from_binary(binary: np.ndarray, min_area: int) -> list[_Component]:
-    count, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    out: list[_Component] = []
-    for idx in range(1, count):
-        x, y, w, h, area = stats[idx]
-        if area < min_area:
-            continue
-        cx, cy = centroids[idx]
-        out.append(
-            _Component(
-                id=idx,
-                x=int(x),
-                y=int(y),
-                w=int(w),
-                h=int(h),
-                area=int(area),
-                cx=float(cx),
-                cy=float(cy),
-            )
-        )
-    return out
-
-
 def _detect_on_page(image_bgr: np.ndarray, model: _TemplateModel, cfg: DetectionConfig) -> list[Candidate]:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    # Baseline binary (dark-contrast) + adaptive color/contrast binary.
+    global_binary = _foreground_binary(image_bgr, dark_threshold=cfg.dark_threshold, for_template=False)
+    adaptive_binary = _adaptive_color_binary(image_bgr)
 
-    dark_threshold = cfg.dark_threshold if cfg.dark_threshold > 0 else _auto_dark_threshold(gray)
-    binary = np.where(gray < dark_threshold, 255, 0).astype(np.uint8)
+    global_components = _filter_page_components(global_binary, model, cfg)
+    adaptive_components = _filter_page_components(adaptive_binary, model, cfg)
 
-    components = _filter_page_components(binary, model, cfg)
-    if len(components) < 2:
-        return []
+    global_pairs = _pair_components(global_components, model, cfg) if len(global_components) >= 2 else []
+    adaptive_pairs = _pair_components(adaptive_components, model, cfg) if len(adaptive_components) >= 2 else []
 
-    pair_candidates = _pair_components(components, model, cfg)
-    pair_candidates = _select_best_pairs(pair_candidates, cfg.nms_iou_threshold)
+    selected: list[_PairCandidate] = []
+    if global_pairs:
+        selected.extend(_select_best_pairs(global_pairs, cfg.nms_iou_threshold))
+    if adaptive_pairs:
+        selected.extend(_select_best_pairs(adaptive_pairs, cfg.nms_iou_threshold))
+
+    pair_candidates = _nms_pairs(selected, cfg.nms_iou_threshold)
 
     result: list[Candidate] = []
     for cand in pair_candidates:
@@ -247,9 +221,95 @@ def _detect_on_page(image_bgr: np.ndarray, model: _TemplateModel, cfg: Detection
     return result
 
 
+def _foreground_binary(image_bgr: np.ndarray, dark_threshold: int, for_template: bool) -> np.ndarray:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    if for_template:
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        if np.count_nonzero(binary) < 8:
+            binary = np.where(gray < 180, 255, 0).astype(np.uint8)
+        if np.count_nonzero(binary) < 8:
+            binary = np.where(gray < 230, 255, 0).astype(np.uint8)
+        return binary
+
+    threshold = dark_threshold if dark_threshold > 0 else _auto_dark_threshold(gray)
+    return np.where(gray < threshold, 255, 0).astype(np.uint8)
+
+
+def _adaptive_color_binary(image_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    block_size = 31 if min(gray.shape) >= 31 else max(3, (min(gray.shape) // 2) * 2 + 1)
+    adaptive_mask = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        block_size,
+        12,
+    )
+
+    kernel_size = max(3, int(round(min(gray.shape) * 0.01)))
+    kernel_size = min(kernel_size | 1, 15)
+    blackhat = cv2.morphologyEx(
+        gray,
+        cv2.MORPH_BLACKHAT,
+        np.ones((kernel_size, kernel_size), dtype=np.uint8),
+    )
+    bh_threshold = max(8, int(np.percentile(blackhat, 95)))
+    blackhat_mask = np.where(blackhat >= bh_threshold, 255, 0).astype(np.uint8)
+    return cv2.bitwise_and(adaptive_mask, blackhat_mask)
+
+
 def _auto_dark_threshold(gray: np.ndarray) -> int:
-    # Fixed auto default is intentionally conservative for noisy engineering drawings.
+    # Conservative default that works well for tiny markup strokes.
     return 90
+
+
+def _components_from_binary(binary: np.ndarray, min_area: int) -> list[_Component]:
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    out: list[_Component] = []
+
+    for idx in range(1, count):
+        x, y, w, h, area = stats[idx]
+        if area < min_area:
+            continue
+
+        roi = np.where(labels[y : y + h, x : x + w] == idx, 255, 0).astype(np.uint8)
+        contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        contour = max(contours, key=cv2.contourArea)
+        hu = _hu_signature(contour)
+
+        cx, cy = centroids[idx]
+        out.append(
+            _Component(
+                id=idx,
+                x=int(x),
+                y=int(y),
+                w=int(w),
+                h=int(h),
+                area=int(area),
+                cx=float(cx),
+                cy=float(cy),
+                hu=hu,
+            )
+        )
+
+    return out
+
+
+def _hu_signature(contour: np.ndarray) -> tuple[float, ...]:
+    hu = cv2.HuMoments(cv2.moments(contour)).flatten()
+    sig: list[float] = []
+    for value in hu.tolist():
+        value = float(value)
+        sig.append(float(-np.sign(value) * np.log10(abs(value) + 1e-12)))
+    return tuple(sig)
+
+
+def _hu_distance(a: tuple[float, ...], b: tuple[float, ...]) -> float:
+    return float(np.mean(np.abs(np.asarray(a) - np.asarray(b))))
 
 
 def _filter_page_components(binary: np.ndarray, model: _TemplateModel, cfg: DetectionConfig) -> list[_Component]:
@@ -257,10 +317,10 @@ def _filter_page_components(binary: np.ndarray, model: _TemplateModel, cfg: Dete
     if not comps:
         return []
 
-    max_area = int(cfg.max_component_area * max(1.0, cfg.max_scale * cfg.max_scale))
-    min_height = max(2, int(round(model.height * cfg.min_scale * 0.45)))
-    max_height = max(min_height + 1, int(round(model.height * cfg.max_scale * 2.4)))
-    max_width = max(cfg.max_component_width, int(round(model.height * cfg.max_scale * 1.8)))
+    max_area = int(cfg.max_component_area * max(1.0, cfg.max_scale))
+    min_height = max(2, int(round(model.height * cfg.min_scale * 0.5)))
+    max_height = max(min_height + 1, int(round(model.height * cfg.max_scale * 1.4)))
+    max_width = max(cfg.max_component_width, int(round(model.height * cfg.max_scale * 0.8)))
 
     filtered: list[_Component] = []
     for comp in comps:
@@ -312,14 +372,21 @@ def _pair_components(
             pair_dy = abs(rf[4] - lf[4])
             aspect_ratio = float(w) / float(h)
 
-            if pair_dx < 0.3 or pair_dx > 2.0:
+            if pair_dx < 0.2 or pair_dx > 2.4:
                 continue
-            if pair_dy > 0.7:
+            if pair_dy > 0.9:
                 continue
-            if aspect_ratio < 0.45 or aspect_ratio > 3.2:
+            if aspect_ratio < 0.35 or aspect_ratio > 4.0:
                 continue
 
-            error = _feature_error(lf, rf, pair_dx, pair_dy, aspect_ratio, model)
+            error = _feature_error(
+                lf=lf,
+                rf=rf,
+                pair_dx=pair_dx,
+                pair_dy=pair_dy,
+                aspect_ratio=aspect_ratio,
+                model=model,
+            )
             score = 1.0 / (1.0 + error)
             if score < cfg.match_threshold:
                 continue
@@ -366,20 +433,18 @@ def _feature_error(
 ) -> float:
     lw, lh, la, _, lcy = lf
     rw, rh, ra, _, rcy = rf
-
-    # Weighted geometric difference to target template layout.
     return (
-        abs(lw - model.left_w) * 1.2
-        + abs(lh - model.left_h) * 1.1
-        + abs(la - model.left_a) * 0.8
+        abs(lw - model.left_w) * 1.0
+        + abs(lh - model.left_h) * 1.0
+        + abs(la - model.left_a) * 0.7
         + abs(lcy - model.left_cy) * 0.5
-        + abs(rw - model.right_w) * 1.2
-        + abs(rh - model.right_h) * 1.1
-        + abs(ra - model.right_a) * 0.8
+        + abs(rw - model.right_w) * 1.0
+        + abs(rh - model.right_h) * 1.0
+        + abs(ra - model.right_a) * 0.7
         + abs(rcy - model.right_cy) * 0.5
-        + abs(pair_dx - model.dx) * 1.2
-        + abs(pair_dy - model.dy) * 1.1
-        + abs(aspect_ratio - model.aspect_ratio) * 1.0
+        + abs(pair_dx - model.dx) * 1.0
+        + abs(pair_dy - model.dy) * 0.9
+        + abs(aspect_ratio - model.aspect_ratio) * 0.8
     )
 
 
@@ -397,7 +462,7 @@ def _select_best_pairs(candidates: Sequence[_PairCandidate], iou_threshold: floa
 
         overlap = False
         for prev in kept:
-            if _pair_iou(cand, prev) >= iou_threshold:
+            if _pair_iou(cand, prev) >= iou_threshold or _pair_center_too_close(cand, prev):
                 overlap = True
                 break
         if overlap:
@@ -407,6 +472,20 @@ def _select_best_pairs(candidates: Sequence[_PairCandidate], iou_threshold: floa
         used_component_ids.add(cand.left_id)
         used_component_ids.add(cand.right_id)
 
+    return kept
+
+
+def _nms_pairs(candidates: Sequence[_PairCandidate], iou_threshold: float) -> list[_PairCandidate]:
+    if not candidates:
+        return []
+    ordered = sorted(candidates, key=lambda c: c.score, reverse=True)
+    kept: list[_PairCandidate] = []
+    for cand in ordered:
+        if all(
+            _pair_iou(cand, prev) < iou_threshold and not _pair_center_too_close(cand, prev)
+            for prev in kept
+        ):
+            kept.append(cand)
     return kept
 
 
@@ -422,6 +501,16 @@ def _pair_iou(a: _PairCandidate, b: _PairCandidate) -> float:
         return 0.0
     union = a.w * a.h + b.w * b.h - inter
     return float(inter) / float(union)
+
+
+def _pair_center_too_close(a: _PairCandidate, b: _PairCandidate) -> bool:
+    ax = a.x + a.w / 2.0
+    ay = a.y + a.h / 2.0
+    bx = b.x + b.w / 2.0
+    by = b.y + b.h / 2.0
+    dist = float(np.hypot(ax - bx, ay - by))
+    max_dim = float(max(a.w, a.h, b.w, b.h))
+    return dist < 1.8 * max_dim
 
 
 def _scale_candidates(candidates: Sequence[Candidate], factor: float) -> list[Candidate]:

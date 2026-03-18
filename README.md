@@ -25,15 +25,16 @@ The app outputs:
 The detector is tuned for noisy/blurred drawings by matching the black symbol geometry from the template:
 - left straight stroke + right reversed-L stroke
 - connected-component pairing with template-shape scoring
+- adaptive contrast extraction (color-tolerant, not black-only)
 - scale filtering + duplicate suppression (NMS)
 
 If counts are too high (false positives):
-- increase `Match threshold` (for example `0.60` to `0.72`)
-- lower `Dark threshold` (for example `90` to `75`)
+- increase `Match threshold` (for example `0.58` to `0.70`)
+- lower `Dark threshold` only if you are using manual value (for example `110` to `90`)
 
 If counts are too low (missed detections):
-- decrease `Match threshold` (for example `0.60` to `0.52`)
-- increase `Dark threshold` (for example `90` to `105`)
+- decrease `Match threshold` (for example `0.58` to `0.50`)
+- increase `Dark threshold` only if needed (for example `90` to `115`) or keep `0` for auto
 - widen scale range (increase `Max scale`)
 
 ## CLI mode (optional)
