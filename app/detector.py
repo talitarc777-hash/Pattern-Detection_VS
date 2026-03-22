@@ -13,17 +13,21 @@ import numpy as np
 @dataclass(frozen=True)
 class DetectionConfig:
     dpi: int = 220
-    match_threshold: float = 0.50
-    min_scale: float = 0.35
-    max_scale: float = 8.0
+    match_threshold: float = 0.45
+    min_scale: float = 0.18
+    max_scale: float = 1.0
     dark_threshold: int = 0  # 0 means auto
-    nms_iou_threshold: float = 0.2
-    max_detection_dim: int = 1700
+    nms_iou_threshold: float = 0.35
+    num_scales: int = 12  # number of scale steps for matchTemplate sweep
+    max_detection_dim: int = 2500
     min_component_area: int = 2
-    max_component_area: int = 1200
-    max_component_width: int = 48
+    max_component_area: int = 1800
+    max_component_width: int = 72
     min_component_height: int = 2
-    max_neighbors: int = 8
+    max_neighbors: int = 10
+    scope: tuple[tuple[float, float], ...] | None = None
+    scope_min_overlap: float = 0.6
+    color_sensitivity: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,10 @@ class _TemplateModel:
     hu: tuple[float, ...]
     component_count: int
     parts: tuple[_TemplatePart, ...]
+    color_profile: "_ColorProfile"
+    color_weight: float
+    ignore_high_saturation: bool
+    circularity: float
 
 
 @dataclass(frozen=True)
@@ -96,6 +104,31 @@ class _GroupCandidate:
     score: float
     scale: float
     component_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _ColorProfile:
+    fg_lab_mean: tuple[float, float, float]
+    fg_lab_std: tuple[float, float, float]
+    bg_lab_mean: tuple[float, float, float]
+    bg_lab_std: tuple[float, float, float]
+    fg_hue_mean: float
+    fg_hue_spread: float
+    fg_sat_mean: float
+    fg_sat_std: float
+    fg_chroma_mean: float
+    fg_chroma_std: float
+    bg_contrast: float
+    chromatic: bool
+
+
+@dataclass(frozen=True)
+class _ColorPolicy:
+    weight: float
+    min_similarity: float
+    binary_threshold: float
+    tolerance_scale: float
+    use_color_map: bool
 
 
 def load_document_pages(path: Path, dpi: int) -> list[np.ndarray]:
@@ -126,11 +159,29 @@ def detect_document(
 
     for page_idx, page_img in enumerate(pages, start=1):
         detect_img, detect_scale = _resize_for_detection(page_img, cfg.max_detection_dim)
-        group_candidates = _detect_on_page(detect_img, template_model, cfg)
-        scaled_candidates = _scale_candidates(group_candidates, 1.0 / detect_scale)
+        scope_polygon = _resolve_scope_polygon(detect_img.shape[:2], cfg.scope)
+        scope_rect = _polygon_bbox(scope_polygon)
+
+        crop_x = 0
+        crop_y = 0
+        detect_view = detect_img
+        if scope_rect is not None:
+            crop_x, crop_y, crop_x1, crop_y1 = scope_rect
+            detect_view = detect_img[crop_y:crop_y1, crop_x:crop_x1]
+
+        group_candidates = _detect_on_page(detect_view, template_model, cfg)
+        offset_candidates = _offset_candidates(group_candidates, crop_x, crop_y)
+        scoped_candidates = _filter_candidates_by_scope(offset_candidates, scope_polygon, cfg.scope_min_overlap)
+        scaled_candidates = _scale_candidates(scoped_candidates, 1.0 / detect_scale)
+
+        page_scope = None
+        if scope_polygon is not None:
+            page_scope = tuple(
+                (int(round(x / detect_scale)), int(round(y / detect_scale))) for x, y in scope_polygon
+            )
 
         total_count += len(scaled_candidates)
-        annotated = _draw_candidates(page_img, scaled_candidates)
+        annotated = _draw_candidates(page_img, scaled_candidates, page_scope)
 
         annotated_path = output_dir / f"{input_path.stem}_page{page_idx:03d}_annotated.png"
         _imwrite_unicode(annotated_path, annotated)
@@ -152,7 +203,8 @@ def detect_document(
 
 
 def _build_template_model(template_bgr: np.ndarray) -> _TemplateModel:
-    binary = _foreground_binary(template_bgr, dark_threshold=0, for_template=True)
+    prep_template, ignore_high_saturation = _prepare_template_image(template_bgr)
+    binary = _foreground_binary(prep_template, dark_threshold=0, for_template=True)
     components = _components_from_binary(binary, min_area=2)
     if not components:
         raise ValueError("Template must contain visible foreground.")
@@ -172,7 +224,13 @@ def _build_template_model(template_bgr: np.ndarray) -> _TemplateModel:
 
     width = int(x1 - x0)
     height = int(y1 - y0)
-    parts = tuple(_normalize_part(comp, x0=x0, y0=y0, width=width, height=height, union_area=union_area) for comp in major_components)
+    template_crop = prep_template[y0:y1, x0:x1]
+    parts = tuple(
+        _normalize_part(comp, x0=x0, y0=y0, width=width, height=height, union_area=union_area)
+        for comp in major_components
+    )
+    color_profile, color_weight = _template_color_signature(template_crop, union_mask)
+    circularity = _mask_circularity(union_mask)
 
     return _TemplateModel(
         mask=union_mask,
@@ -184,39 +242,86 @@ def _build_template_model(template_bgr: np.ndarray) -> _TemplateModel:
         hu=_hu_signature(union_mask),
         component_count=len(major_components),
         parts=parts,
+        color_profile=color_profile,
+        color_weight=color_weight,
+        ignore_high_saturation=ignore_high_saturation,
+        circularity=circularity,
     )
 
 
 def _detect_on_page(image_bgr: np.ndarray, model: _TemplateModel, cfg: DetectionConfig) -> list[Candidate]:
-    binaries = [_foreground_binary(image_bgr, dark_threshold=cfg.dark_threshold, for_template=False)]
-    if model.component_count == 1:
-        binaries.append(_background_distance_binary(image_bgr))
-        binaries.append(_adaptive_color_binary(image_bgr))
-    elif model.area >= 80:
-        binaries.append(_adaptive_color_binary(image_bgr))
+    working_bgr = image_bgr
+    color_policy = _resolve_color_policy(model, cfg)
+    binaries = [
+        _foreground_binary(working_bgr, dark_threshold=cfg.dark_threshold, for_template=False),
+        _background_distance_binary(working_bgr),
+        _adaptive_color_binary(working_bgr),
+        _clahe_binary(working_bgr),
+    ]
+    if color_policy.use_color_map:
+        binaries.append(_template_color_binary(working_bgr, model, cfg))
 
     all_candidates: list[_GroupCandidate] = []
     for binary in binaries:
         components = _filter_page_components(binary, model, cfg)
         if not components:
             continue
-        group_candidates = _score_candidate_groups(components, model, cfg)
+        group_candidates = _score_candidate_groups(components, working_bgr, model, cfg)
         if group_candidates:
             all_candidates.extend(group_candidates)
 
+    blob_candidates = _simple_blob_candidates(working_bgr, model, cfg)
+    all_candidates.extend(blob_candidates)
+
+    if not _is_simple_blob_model(model):
+        # --- pixel-level template matching passes (primary signal) ---
+        tmpl_mask = model.mask  # already a 2-D uint8 binary
+
+        match_candidates = _template_match_candidates(working_bgr, tmpl_mask, model, cfg)
+        all_candidates.extend(match_candidates)
+
+        edge_candidates = _edge_match_candidates(working_bgr, tmpl_mask, model, cfg)
+        all_candidates.extend(edge_candidates)
+
     final_candidates = _nms_groups(all_candidates, cfg.nms_iou_threshold)
-    return [
-        Candidate(
-            x=cand.x,
-            y=cand.y,
-            w=cand.w,
-            h=cand.h,
-            score=cand.score,
-            angle=0.0,
-            scale=cand.scale,
+    
+    # --- Post-NMS Color Penalty ---
+    # We apply color checking here because cv2.kmeans inside the matching loops 
+    # would run thousands of times. Here it only runs on the NMS peaks.
+    filtered_results: list[Candidate] = []
+    for cand in final_candidates:
+        final_score = cand.score
+        if color_policy.weight > 0.0:
+            # Cand might be out of bounds if correlation drifted it slightly
+            y0, x0 = cand.y, cand.x
+            y1 = min(image_bgr.shape[0], y0 + cand.h)
+            x1 = min(image_bgr.shape[1], x0 + cand.w)
+            
+            if y1 > y0 and x1 > x0:
+                cand_bgr = image_bgr[y0:y1, x0:x1]
+                color_sim = _color_similarity(cand_bgr, model, cfg)
+                if color_sim < color_policy.min_similarity:
+                    continue  # Fail hard
+                
+                color_mix = 0.15 + 0.40 * color_policy.weight
+                new_score = (1.0 - color_mix) * cand.score + color_mix * color_sim
+                if new_score < cfg.match_threshold:
+                    continue
+                final_score = new_score
+        
+        filtered_results.append(
+            Candidate(
+                x=max(0, cand.x),
+                y=max(0, cand.y),
+                w=cand.w,
+                h=cand.h,
+                score=final_score,
+                angle=0.0,
+                scale=cand.scale,
+            )
         )
-        for cand in final_candidates
-    ]
+
+    return filtered_results
 
 
 def _foreground_binary(image_bgr: np.ndarray, dark_threshold: int, for_template: bool) -> np.ndarray:
@@ -234,7 +339,49 @@ def _foreground_binary(image_bgr: np.ndarray, dark_threshold: int, for_template:
         return binary
 
     threshold = dark_threshold if dark_threshold > 0 else _auto_dark_threshold(gray)
-    return np.where(gray < threshold, 255, 0).astype(np.uint8)
+    binary = np.where(gray < threshold, 255, 0).astype(np.uint8)
+    return cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8))
+
+
+def _prepare_template_image(template_bgr: np.ndarray) -> tuple[np.ndarray, bool]:
+    hsv = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    sat = hsv[..., 1]
+    val = hsv[..., 2]
+    strong_color = sat >= max(42.0, float(np.percentile(sat, 82)))
+    dark_or_mid = val <= max(210.0, float(np.percentile(val, 88)))
+    strong_mask = (strong_color & dark_or_mid).astype(np.uint8) * 255
+    colored_pixels = int(np.count_nonzero(strong_mask))
+    total_pixels = max(1, template_bgr.shape[0] * template_bgr.shape[1])
+    colored_ratio = colored_pixels / float(total_pixels)
+    sat95 = float(np.percentile(sat, 95))
+
+    ring_like = False
+    if colored_pixels > 0:
+        comps = _components_from_binary(strong_mask, min_area=max(4, int(round(total_pixels * 0.01))))
+        if comps:
+            comp = max(comps, key=lambda item: item.area)
+            fill_ratio = float(comp.area) / float(max(1, comp.w * comp.h))
+            center_dx = abs((comp.cx / float(max(1, template_bgr.shape[1]))) - 0.5)
+            center_dy = abs((comp.cy / float(max(1, template_bgr.shape[0]))) - 0.5)
+            centered = center_dx <= 0.18 and center_dy <= 0.18
+            ring_like = fill_ratio < 0.30 or not centered
+
+    ignore_high_saturation = colored_ratio >= 0.06 and sat95 >= 70.0 and ring_like
+    if not ignore_high_saturation:
+        return template_bgr, False
+    return _neutralize_high_saturation(template_bgr, sat_threshold=52.0, val_threshold=230.0), True
+def _neutralize_high_saturation(image_bgr: np.ndarray, sat_threshold: float, val_threshold: float) -> np.ndarray:
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    sat = hsv[..., 1]
+    val = hsv[..., 2]
+    strong_mask = (sat >= sat_threshold) & (val <= val_threshold)
+    if not np.any(strong_mask):
+        return image_bgr
+
+    background = _estimate_border_background(image_bgr)
+    neutralized = image_bgr.copy()
+    neutralized[strong_mask] = background.astype(np.uint8)
+    return neutralized
 
 
 def _adaptive_color_binary(image_bgr: np.ndarray) -> np.ndarray:
@@ -271,6 +418,174 @@ def _background_distance_binary(image_bgr: np.ndarray) -> np.ndarray:
     return cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8))
 
 
+def _template_color_binary(image_bgr: np.ndarray, model: _TemplateModel, cfg: DetectionConfig) -> np.ndarray:
+    score = _color_response_map(image_bgr, model, cfg)
+    threshold = _resolve_color_policy(model, cfg).binary_threshold
+    binary = np.where(score >= threshold, 255, 0).astype(np.uint8)
+    return cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8))
+
+
+def _clahe_binary(image_bgr: np.ndarray) -> np.ndarray:
+    """CLAHE-equalized Otsu threshold — helps on faded/low-contrast scans."""
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    eq = clahe.apply(gray)
+    _, binary = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    return cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8))
+
+
+def _template_match_candidates(
+    image_bgr: np.ndarray,
+    tmpl_mask: np.ndarray,
+    model: _TemplateModel,
+    cfg: DetectionConfig,
+) -> list[_GroupCandidate]:
+    """Multi-scale cv2.matchTemplate sweep — pixel-level correlation on grayscale or color-distance map."""
+    color_policy = _resolve_color_policy(model, cfg)
+    if color_policy.use_color_map:
+        gray = np.clip(_color_response_map(image_bgr, model, cfg) * 255.0, 0, 255).astype(np.uint8)
+    else:
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    ih, iw = gray.shape[:2]
+    candidates: list[_GroupCandidate] = []
+
+    effective_min_scale = _effective_min_scale(cfg, model)
+    tpl_threshold = max(0.28, cfg.match_threshold - 0.10)
+    scales = np.geomspace(effective_min_scale, cfg.max_scale, _effective_num_scales(cfg, model))
+
+    for scale in scales:
+        tw = max(4, int(round(model.width * scale)))
+        th = max(4, int(round(model.height * scale)))
+        if tw >= iw or th >= ih:
+            continue
+
+        tmpl_resized = cv2.resize(tmpl_mask, (tw, th), interpolation=cv2.INTER_AREA)
+        result = cv2.matchTemplate(gray, tmpl_resized, cv2.TM_CCOEFF_NORMED)
+        locs = np.argwhere(result >= tpl_threshold)
+        for row, col in locs:
+            base_score = float(result[row, col])
+            candidates.append(
+                _GroupCandidate(
+                    x=int(col),
+                    y=int(row),
+                    w=tw,
+                    h=th,
+                    score=base_score,
+                    scale=float(scale),
+                    component_ids=(),
+                )
+            )
+
+    return candidates
+
+
+def _edge_match_candidates(
+    image_bgr: np.ndarray,
+    tmpl_mask: np.ndarray,
+    model: _TemplateModel,
+    cfg: DetectionConfig,
+) -> list[_GroupCandidate]:
+    """Canny-edge matchTemplate — effective on line-art / CAD drawings."""
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    page_edges = cv2.Canny(gray, 40, 120)
+    ih, iw = page_edges.shape[:2]
+    candidates: list[_GroupCandidate] = []
+
+    tpl_threshold = max(0.25, cfg.match_threshold - 0.15)
+    scales = np.linspace(cfg.min_scale, cfg.max_scale, max(6, cfg.num_scales // 2))
+
+    for scale in scales:
+        tw = max(4, int(round(model.width * scale)))
+        th = max(4, int(round(model.height * scale)))
+        if tw >= iw or th >= ih:
+            continue
+
+        tmpl_resized = cv2.resize(tmpl_mask, (tw, th), interpolation=cv2.INTER_AREA)
+        tmpl_edges = cv2.Canny(tmpl_resized, 40, 120)
+        if not np.any(tmpl_edges):
+            continue
+
+        result = cv2.matchTemplate(page_edges, tmpl_edges, cv2.TM_CCOEFF_NORMED)
+        locs = np.argwhere(result >= tpl_threshold)
+        for row, col in locs:
+            base_score = float(result[row, col]) * 0.90  # slight deflate so shape-matcher wins ties
+            candidates.append(
+                _GroupCandidate(
+                    x=int(col),
+                    y=int(row),
+                    w=tw,
+                    h=th,
+                    score=base_score,
+                    scale=float(scale),
+                    component_ids=(),
+                )
+            )
+
+    return candidates
+
+
+def _simple_blob_candidates(
+    image_bgr: np.ndarray,
+    model: _TemplateModel,
+    cfg: DetectionConfig,
+) -> list[_GroupCandidate]:
+    if not _is_simple_blob_model(model):
+        return []
+
+    color_policy = _resolve_color_policy(model, cfg)
+    binary = cv2.bitwise_or(
+        _foreground_binary(image_bgr, dark_threshold=cfg.dark_threshold, for_template=False),
+        _background_distance_binary(image_bgr),
+    )
+    if color_policy.use_color_map:
+        binary = cv2.bitwise_or(binary, _template_color_binary(image_bgr, model, cfg))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
+    components = _components_from_binary(binary, min_area=cfg.min_component_area)
+    if not components:
+        return []
+
+    effective_min_scale = _effective_min_scale(cfg, model)
+    min_area = max(cfg.min_component_area, int(round(model.area * (effective_min_scale**2) * 0.35)))
+    max_area = max(cfg.max_component_area, int(round(model.area * (cfg.max_scale**2) * 1.2)))
+    min_score = max(0.30, cfg.match_threshold - 0.12)
+
+    candidates: list[_GroupCandidate] = []
+    for comp in components:
+        if comp.area < min_area or comp.area > max_area:
+            continue
+        if comp.w < 3 or comp.h < 3:
+            continue
+
+        scale = float(np.sqrt(comp.area / float(max(1, model.area))))
+        if scale < effective_min_scale or scale > cfg.max_scale:
+            continue
+
+        circularity = _mask_circularity(comp.mask)
+        circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.35)
+        aspect_sim = _ratio_similarity(float(comp.w) / float(max(1, comp.h)), model.aspect_ratio)
+        fill_ratio = float(comp.area) / float(max(1, comp.w * comp.h))
+        fill_sim = max(0.0, 1.0 - abs(fill_ratio - model.fill_ratio) / 0.35)
+        color_sim = _color_similarity(image_bgr[comp.y:comp.y + comp.h, comp.x:comp.x + comp.w], model, cfg)
+
+        score = 0.38 * circ_sim + 0.20 * aspect_sim + 0.22 * fill_sim + 0.20 * color_sim
+        if score < min_score:
+            continue
+
+        candidates.append(
+            _GroupCandidate(
+                x=comp.x,
+                y=comp.y,
+                w=comp.w,
+                h=comp.h,
+                score=float(score),
+                scale=float(scale),
+                component_ids=(comp.id,),
+            )
+        )
+
+    return candidates
+
+
 def _estimate_border_background(image_bgr: np.ndarray) -> np.ndarray:
     top = image_bgr[0, :, :]
     bottom = image_bgr[-1, :, :]
@@ -282,7 +597,7 @@ def _estimate_border_background(image_bgr: np.ndarray) -> np.ndarray:
 
 def _auto_dark_threshold(gray: np.ndarray) -> int:
     percentile = float(np.percentile(gray, 0.35))
-    return int(np.clip(percentile + 18.0, 70.0, 140.0))
+    return int(np.clip(percentile + 18.0, 70.0, 145.0))
 
 
 def _components_from_binary(binary: np.ndarray, min_area: int) -> list[_Component]:
@@ -318,11 +633,12 @@ def _filter_page_components(binary: np.ndarray, model: _TemplateModel, cfg: Dete
     if not components:
         return []
 
-    min_area = max(cfg.min_component_area, int(round(model.area * (cfg.min_scale**2) * 0.03)))
+    effective_min_scale = _effective_min_scale(cfg, model)
+    min_area = max(cfg.min_component_area, int(round(model.area * (effective_min_scale**2) * 0.03)))
     max_area = max(cfg.max_component_area, int(round(model.area * (cfg.max_scale**2) * 1.4)))
-    min_height = max(cfg.min_component_height, int(round(model.height * cfg.min_scale * 0.18)))
-    max_height = max(min_height + 1, int(round(model.height * cfg.max_scale * 1.2)))
-    max_width = max(cfg.max_component_width, int(round(model.width * cfg.max_scale * 1.2)))
+    min_height = max(cfg.min_component_height, int(round(model.height * effective_min_scale * 0.18)))
+    max_height = max(min_height + 1, int(round(model.height * cfg.max_scale * 1.3)))
+    max_width = max(cfg.max_component_width, int(round(model.width * cfg.max_scale * 1.3)))
 
     filtered: list[_Component] = []
     for comp in components:
@@ -338,6 +654,7 @@ def _filter_page_components(binary: np.ndarray, model: _TemplateModel, cfg: Dete
 
 def _score_candidate_groups(
     components: Sequence[_Component],
+    image_bgr: np.ndarray,
     model: _TemplateModel,
     cfg: DetectionConfig,
 ) -> list[_GroupCandidate]:
@@ -350,7 +667,7 @@ def _score_candidate_groups(
             continue
         seen_group_ids.add(group_ids)
 
-        candidate = _score_group(group, model, cfg)
+        candidate = _score_group(group, image_bgr, model, cfg)
         if candidate is not None:
             candidates.append(candidate)
 
@@ -392,6 +709,7 @@ def _generate_candidate_groups(
 
 def _score_group(
     group: Sequence[_Component],
+    image_bgr: np.ndarray,
     model: _TemplateModel,
     cfg: DetectionConfig,
 ) -> _GroupCandidate | None:
@@ -404,7 +722,7 @@ def _score_group(
     scale_h = float(height) / float(max(1, model.height))
     scale_w = float(width) / float(max(1, model.width))
     scale = 0.5 * (scale_h + scale_w)
-    if scale < cfg.min_scale or scale > cfg.max_scale:
+    if scale < _effective_min_scale(cfg, model) or scale > cfg.max_scale:
         return None
 
     union_mask = _render_group_mask(group, x0, y0, width, height)
@@ -425,8 +743,12 @@ def _score_group(
     fill_ratio = float(union_area) / float(max(1, width * height))
     fill_sim = max(0.0, 1.0 - abs(fill_ratio - model.fill_ratio) / 0.55)
     layout_sim = _layout_similarity(group, x0, y0, width, height, union_area, model)
+    color_policy = _resolve_color_policy(model, cfg)
+    color_sim = _color_similarity(image_bgr[y0:y1, x0:x1], model, cfg)
+    if color_sim < color_policy.min_similarity:
+        return None
 
-    score = (
+    base_score = (
         0.34 * iou
         + 0.18 * dilated_iou
         + 0.18 * hu_sim
@@ -434,6 +756,8 @@ def _score_group(
         + 0.08 * fill_sim
         + 0.10 * layout_sim
     )
+    color_mix = 0.12 + 0.35 * color_policy.weight
+    score = (1.0 - color_mix) * base_score + color_mix * color_sim
     if score < cfg.match_threshold:
         return None
 
@@ -462,7 +786,6 @@ def _layout_similarity(
 
     if len(group) != len(model.parts):
         if model.component_count == 1 and len(group) == 2:
-            # Connected templates can be split by rasterization in low-quality pages.
             return 0.72
         return 0.0
 
@@ -502,6 +825,281 @@ def _normalize_part(
 
 def _similarity_from_distance(distance: float, scale: float) -> float:
     return 1.0 / (1.0 + max(0.0, distance) * scale)
+
+
+def _mask_circularity(mask: np.ndarray) -> float:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0
+    contour = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(contour))
+    perimeter = float(cv2.arcLength(contour, True))
+    if area <= 0.0 or perimeter <= 0.0:
+        return 0.0
+    return float(np.clip((4.0 * np.pi * area) / (perimeter * perimeter), 0.0, 1.0))
+
+
+def _effective_min_scale(cfg: DetectionConfig, model: _TemplateModel) -> float:
+    if model.component_count == 1 and model.fill_ratio >= 0.45 and model.circularity >= 0.72:
+        return min(cfg.min_scale, 0.04)
+    return cfg.min_scale
+
+
+def _effective_num_scales(cfg: DetectionConfig, model: _TemplateModel) -> int:
+    if _is_simple_blob_model(model):
+        return max(cfg.num_scales, 24)
+    return cfg.num_scales
+
+
+def _is_simple_blob_model(model: _TemplateModel) -> bool:
+    return model.component_count == 1 and model.fill_ratio >= 0.45 and model.circularity >= 0.72
+
+
+def _resolve_color_policy(model: _TemplateModel, cfg: DetectionConfig) -> _ColorPolicy:
+    mode = cfg.color_sensitivity.strip().lower()
+    if mode not in {"auto", "soft", "strict"}:
+        mode = "auto"
+
+    base_weight = float(np.clip(model.color_weight, 0.0, 1.0))
+    if mode == "soft":
+        weight = base_weight * 0.55
+        tolerance_scale = 1.35
+        min_similarity = 0.14 + 0.22 * weight
+        binary_threshold = 0.30 + 0.16 * weight
+    elif mode == "strict":
+        floor = 0.65 if model.color_profile.chromatic else 0.30
+        weight = max(base_weight, floor)
+        tolerance_scale = 0.78
+        min_similarity = 0.26 + 0.34 * weight
+        binary_threshold = 0.42 + 0.22 * weight
+    else:
+        weight = base_weight
+        tolerance_scale = 1.0
+        if model.color_profile.chromatic:
+            min_similarity = 0.18 + 0.28 * weight
+            binary_threshold = 0.34 + 0.20 * weight
+        else:
+            min_similarity = 0.10 + 0.18 * weight
+            binary_threshold = 0.24 + 0.12 * weight
+
+    return _ColorPolicy(
+        weight=float(np.clip(weight, 0.0, 1.0)),
+        min_similarity=float(np.clip(min_similarity, 0.08, 0.72)),
+        binary_threshold=float(np.clip(binary_threshold, 0.22, 0.82)),
+        tolerance_scale=float(np.clip(tolerance_scale, 0.65, 1.60)),
+        use_color_map=weight >= 0.12,
+    )
+
+
+def _template_color_signature(
+    template_bgr: np.ndarray,
+    mask: np.ndarray,
+) -> tuple[_ColorProfile, float]:
+    fg = mask > 0
+    bg = ~fg
+    if not np.any(fg):
+        neutral = _ColorProfile(
+            fg_lab_mean=(128.0, 128.0, 128.0),
+            fg_lab_std=(0.0, 0.0, 0.0),
+            bg_lab_mean=(128.0, 128.0, 128.0),
+            bg_lab_std=(0.0, 0.0, 0.0),
+            fg_hue_mean=0.0,
+            fg_hue_spread=180.0,
+            fg_sat_mean=0.0,
+            fg_sat_std=0.0,
+            fg_chroma_mean=0.0,
+            fg_chroma_std=0.0,
+            bg_contrast=0.0,
+            chromatic=False,
+        )
+        return neutral, 0.0
+
+    if not np.any(bg):
+        bg = np.zeros_like(fg, dtype=bool)
+
+    profile = _color_profile_from_masks(template_bgr, fg, bg)
+    chroma_gap = profile.bg_contrast
+    color_weight = float(
+        np.clip(
+            max(
+                profile.fg_sat_mean / 90.0,
+                profile.fg_chroma_mean / 18.0,
+                chroma_gap / 22.0,
+            ) - 0.12,
+            0.0,
+            1.0,
+        )
+    )
+    if not profile.chromatic:
+        color_weight *= 0.35
+    return profile, color_weight
+
+
+def _color_profile_from_masks(image_bgr: np.ndarray, fg: np.ndarray, bg: np.ndarray) -> _ColorProfile:
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    chroma = np.linalg.norm(lab[..., 1:] - np.asarray([128.0, 128.0], dtype=np.float32), axis=2)
+
+    fg_lab = lab[fg]
+    bg_lab = lab[bg] if np.any(bg) else lab.reshape(-1, 3)
+    fg_h = hsv[..., 0][fg]
+    fg_s = hsv[..., 1][fg]
+    fg_c = chroma[fg]
+
+    fg_lab_mean = tuple(float(v) for v in fg_lab.mean(axis=0))
+    fg_lab_std = tuple(float(v) for v in fg_lab.std(axis=0))
+    bg_lab_mean = tuple(float(v) for v in bg_lab.mean(axis=0))
+    bg_lab_std = tuple(float(v) for v in bg_lab.std(axis=0))
+    fg_sat_mean = float(fg_s.mean()) if fg_s.size else 0.0
+    fg_sat_std = float(fg_s.std()) if fg_s.size else 0.0
+    fg_chroma_mean = float(fg_c.mean()) if fg_c.size else 0.0
+    fg_chroma_std = float(fg_c.std()) if fg_c.size else 0.0
+    fg_hue_mean = _circular_hue_mean(fg_h)
+    fg_hue_spread = _circular_hue_spread(fg_h, fg_hue_mean)
+    bg_contrast = float(np.linalg.norm(np.asarray(fg_lab_mean) - np.asarray(bg_lab_mean)))
+    chromatic = bool(fg_sat_mean >= 18.0 or fg_chroma_mean >= 10.0 or bg_contrast >= 9.0)
+
+    return _ColorProfile(
+        fg_lab_mean=fg_lab_mean,
+        fg_lab_std=fg_lab_std,
+        bg_lab_mean=bg_lab_mean,
+        bg_lab_std=bg_lab_std,
+        fg_hue_mean=fg_hue_mean,
+        fg_hue_spread=fg_hue_spread,
+        fg_sat_mean=fg_sat_mean,
+        fg_sat_std=fg_sat_std,
+        fg_chroma_mean=fg_chroma_mean,
+        fg_chroma_std=fg_chroma_std,
+        bg_contrast=bg_contrast,
+        chromatic=chromatic,
+    )
+
+
+def _color_response_map(image_bgr: np.ndarray, model: _TemplateModel, cfg: DetectionConfig) -> np.ndarray:
+    policy = _resolve_color_policy(model, cfg)
+    profile = model.color_profile
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    chroma = np.linalg.norm(lab[..., 1:] - np.asarray([128.0, 128.0], dtype=np.float32), axis=2)
+
+    fg_mean = np.asarray(profile.fg_lab_mean, dtype=np.float32)
+    fg_std = np.asarray(profile.fg_lab_std, dtype=np.float32)
+    bg_mean = np.asarray(profile.bg_lab_mean, dtype=np.float32)
+    lab_tol = np.maximum(fg_std * 2.8 + 8.0, np.asarray([10.0, 8.0, 8.0], dtype=np.float32)) * policy.tolerance_scale
+    bg_tol = np.maximum(np.asarray(profile.bg_lab_std, dtype=np.float32) * 2.8 + 10.0, np.asarray([12.0, 10.0, 10.0], dtype=np.float32)) * policy.tolerance_scale
+
+    fg_dist = np.sqrt(np.mean(((lab - fg_mean) / lab_tol) ** 2, axis=2))
+    bg_dist = np.sqrt(np.mean(((lab - bg_mean) / bg_tol) ** 2, axis=2))
+    lab_score = np.exp(-(fg_dist**2))
+    bg_sep_score = np.clip(0.5 + 0.35 * (bg_dist - fg_dist), 0.0, 1.0)
+
+    if profile.chromatic:
+        hue_diff = _circular_hue_diff(hsv[..., 0], profile.fg_hue_mean)
+        hue_tol = max(10.0, profile.fg_hue_spread * 2.4 + 10.0) * policy.tolerance_scale
+        sat_tol = max(12.0, profile.fg_sat_std * 2.8 + 12.0) * policy.tolerance_scale
+        chroma_tol = max(8.0, profile.fg_chroma_std * 2.6 + 8.0) * policy.tolerance_scale
+        hue_score = np.exp(-((hue_diff / hue_tol) ** 2))
+        sat_score = np.exp(-(((hsv[..., 1] - profile.fg_sat_mean) / sat_tol) ** 2))
+        chroma_score = np.exp(-(((chroma - profile.fg_chroma_mean) / chroma_tol) ** 2))
+        score = 0.42 * lab_score + 0.18 * bg_sep_score + 0.20 * hue_score + 0.10 * sat_score + 0.10 * chroma_score
+    else:
+        l_tol = max(10.0, profile.fg_lab_std[0] * 2.8 + 10.0) * policy.tolerance_scale
+        chroma_tol = max(10.0, profile.fg_chroma_std * 3.0 + 10.0) * policy.tolerance_scale
+        light_score = np.exp(-(((lab[..., 0] - profile.fg_lab_mean[0]) / l_tol) ** 2))
+        chroma_score = np.exp(-(((chroma - profile.fg_chroma_mean) / chroma_tol) ** 2))
+        score = 0.52 * lab_score + 0.23 * bg_sep_score + 0.15 * light_score + 0.10 * chroma_score
+
+    return np.clip(score.astype(np.float32), 0.0, 1.0)
+
+
+def _extract_patch_color_profile(candidate_bgr: np.ndarray, model: _TemplateModel) -> _ColorProfile:
+    if _is_simple_blob_model(model):
+        fg = _candidate_foreground_mask(candidate_bgr)
+        bg = ~fg
+        if not np.any(bg):
+            bg = np.zeros_like(fg, dtype=bool)
+        return _color_profile_from_masks(candidate_bgr, fg, bg)
+
+    resized = cv2.resize(candidate_bgr, (model.width, model.height), interpolation=cv2.INTER_AREA)
+    fg = model.mask > 0
+    bg = ~fg
+    return _color_profile_from_masks(resized, fg, bg)
+
+
+def _candidate_foreground_mask(candidate_bgr: np.ndarray) -> np.ndarray:
+    bg_color = _estimate_border_background(candidate_bgr)
+    color_dist = np.linalg.norm(candidate_bgr.astype(np.float32) - bg_color, axis=2)
+    gray = cv2.cvtColor(candidate_bgr, cv2.COLOR_BGR2GRAY)
+    dark_mask = gray <= max(235, int(np.percentile(gray, 85)))
+    color_mask = color_dist >= max(6.0, float(np.percentile(color_dist, 65)))
+    fg = dark_mask | color_mask
+    if not np.any(fg):
+        fg = np.ones(candidate_bgr.shape[:2], dtype=bool)
+    return fg
+
+
+def _color_similarity(candidate_bgr: np.ndarray, model: _TemplateModel, cfg: DetectionConfig) -> float:
+    if candidate_bgr.size == 0:
+        return 0.0
+
+    policy = _resolve_color_policy(model, cfg)
+    if policy.weight <= 0.0:
+        return 1.0
+
+    candidate = _extract_patch_color_profile(candidate_bgr, model)
+    profile = model.color_profile
+
+    lab_tol = np.maximum(np.asarray(profile.fg_lab_std, dtype=np.float32) * 2.8 + 8.0, np.asarray([10.0, 8.0, 8.0], dtype=np.float32)) * policy.tolerance_scale
+    fg_delta = np.asarray(candidate.fg_lab_mean, dtype=np.float32) - np.asarray(profile.fg_lab_mean, dtype=np.float32)
+    lab_score = np.exp(-np.mean((fg_delta / lab_tol) ** 2))
+
+    contrast_tol = max(8.0, profile.bg_contrast * 0.45 + 6.0) * policy.tolerance_scale
+    contrast_score = np.exp(-((candidate.bg_contrast - profile.bg_contrast) / contrast_tol) ** 2)
+
+    if profile.chromatic:
+        hue_tol = max(10.0, profile.fg_hue_spread * 2.4 + 10.0) * policy.tolerance_scale
+        sat_tol = max(12.0, profile.fg_sat_std * 2.8 + 12.0) * policy.tolerance_scale
+        chroma_tol = max(8.0, profile.fg_chroma_std * 2.6 + 8.0) * policy.tolerance_scale
+        hue_score = np.exp(-(_circular_hue_diff(candidate.fg_hue_mean, profile.fg_hue_mean) / hue_tol) ** 2)
+        sat_score = np.exp(-((candidate.fg_sat_mean - profile.fg_sat_mean) / sat_tol) ** 2)
+        chroma_score = np.exp(-((candidate.fg_chroma_mean - profile.fg_chroma_mean) / chroma_tol) ** 2)
+        score = 0.42 * lab_score + 0.16 * contrast_score + 0.20 * hue_score + 0.11 * sat_score + 0.11 * chroma_score
+    else:
+        l_tol = max(10.0, profile.fg_lab_std[0] * 2.8 + 10.0) * policy.tolerance_scale
+        chroma_tol = max(10.0, profile.fg_chroma_std * 3.0 + 10.0) * policy.tolerance_scale
+        light_score = np.exp(-((candidate.fg_lab_mean[0] - profile.fg_lab_mean[0]) / l_tol) ** 2)
+        chroma_score = np.exp(-((candidate.fg_chroma_mean - profile.fg_chroma_mean) / chroma_tol) ** 2)
+        score = 0.54 * lab_score + 0.24 * contrast_score + 0.14 * light_score + 0.08 * chroma_score
+
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _circular_hue_mean(values) -> float:
+    if np.size(values) == 0:
+        return 0.0
+    angles = np.asarray(values, dtype=np.float32) * (2.0 * np.pi / 180.0)
+    sin_mean = float(np.mean(np.sin(angles)))
+    cos_mean = float(np.mean(np.cos(angles)))
+    angle = np.arctan2(sin_mean, cos_mean)
+    if angle < 0.0:
+        angle += 2.0 * np.pi
+    return float(angle * (180.0 / (2.0 * np.pi)))
+
+
+def _circular_hue_spread(values, mean: float) -> float:
+    if np.size(values) == 0:
+        return 180.0
+    diffs = _circular_hue_diff(np.asarray(values, dtype=np.float32), mean)
+    return float(np.mean(diffs))
+
+
+def _circular_hue_diff(values, mean: float) -> np.ndarray | float:
+    arr = np.asarray(values, dtype=np.float32)
+    diff = np.abs(arr - float(mean))
+    diff = np.minimum(diff, 180.0 - diff)
+    if np.isscalar(values):
+        return float(diff)
+    return diff
 
 
 def _ratio_similarity(value: float, reference: float) -> float:
@@ -603,6 +1201,92 @@ def _group_center_too_close(a: _GroupCandidate, b: _GroupCandidate) -> bool:
     return dist < 0.9 * min_dim
 
 
+def _resolve_scope_polygon(
+    image_shape: tuple[int, int] | tuple[int, int, int],
+    scope: tuple[tuple[float, float], ...] | None,
+) -> tuple[tuple[int, int], ...] | None:
+    if scope is None:
+        return None
+    height, width = image_shape[:2]
+    polygon = tuple(
+        (
+            int(round(np.clip(point[0], 0.0, 1.0) * width)),
+            int(round(np.clip(point[1], 0.0, 1.0) * height)),
+        )
+        for point in scope
+    )
+    if len(polygon) < 3:
+        return None
+    return polygon
+
+
+def _polygon_bbox(polygon: tuple[tuple[int, int], ...] | None) -> tuple[int, int, int, int] | None:
+    if polygon is None:
+        return None
+    xs = [point[0] for point in polygon]
+    ys = [point[1] for point in polygon]
+    x0 = min(xs)
+    y0 = min(ys)
+    x1 = max(xs)
+    y1 = max(ys)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+    return x0, y0, x1, y1
+
+
+def _offset_candidates(candidates: Sequence[Candidate], dx: int, dy: int) -> list[Candidate]:
+    if dx == 0 and dy == 0:
+        return list(candidates)
+    return [
+        Candidate(
+            x=cand.x + dx,
+            y=cand.y + dy,
+            w=cand.w,
+            h=cand.h,
+            score=cand.score,
+            angle=cand.angle,
+            scale=cand.scale,
+        )
+        for cand in candidates
+    ]
+
+
+def _filter_candidates_by_scope(
+    candidates: Sequence[Candidate],
+    scope_polygon: tuple[tuple[int, int], ...] | None,
+    min_overlap: float,
+) -> list[Candidate]:
+    if scope_polygon is None:
+        return list(candidates)
+
+    mask = _polygon_mask(scope_polygon)
+    mask_h, mask_w = mask.shape[:2]
+    kept: list[Candidate] = []
+    for cand in candidates:
+        xx1 = max(cand.x, 0)
+        yy1 = max(cand.y, 0)
+        xx2 = min(cand.x + cand.w, mask_w)
+        yy2 = min(cand.y + cand.h, mask_h)
+        if xx2 <= xx1 or yy2 <= yy1:
+            continue
+        overlap = int(np.count_nonzero(mask[yy1:yy2, xx1:xx2]))
+        area = max(1, (xx2 - xx1) * (yy2 - yy1))
+        if float(overlap) / float(area) >= min_overlap:
+            kept.append(cand)
+    return kept
+
+
+def _polygon_mask(polygon: tuple[tuple[int, int], ...]) -> np.ndarray:
+    bbox = _polygon_bbox(polygon)
+    if bbox is None:
+        return np.zeros((1, 1), dtype=np.uint8)
+    _, _, x1, y1 = bbox
+    mask = np.zeros((y1 + 2, x1 + 2), dtype=np.uint8)
+    pts = np.asarray(polygon, dtype=np.int32).reshape((-1, 1, 2))
+    cv2.fillPoly(mask, [pts], 255)
+    return mask
+
+
 def _scale_candidates(candidates: Sequence[Candidate], factor: float) -> list[Candidate]:
     if abs(factor - 1.0) < 1e-9:
         return list(candidates)
@@ -623,24 +1307,53 @@ def _scale_candidates(candidates: Sequence[Candidate], factor: float) -> list[Ca
     return scaled
 
 
-def _draw_candidates(image: np.ndarray, candidates: Sequence[Candidate]) -> np.ndarray:
+def _draw_candidates(
+    image: np.ndarray,
+    candidates: Sequence[Candidate],
+    scope_polygon: tuple[tuple[int, int], ...] | None = None,
+) -> np.ndarray:
     annotated = image.copy()
+    if scope_polygon is not None:
+        pts = np.asarray(scope_polygon, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(annotated, [pts], isClosed=True, color=(0, 180, 0), thickness=4)
+        x0, y0, _, _ = _polygon_bbox(scope_polygon)
+        cv2.putText(
+            annotated,
+            "Scope",
+            (x0 + 6, max(24, y0 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 140, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
     for idx, cand in enumerate(candidates, start=1):
         cv2.rectangle(
             annotated,
             (cand.x, cand.y),
             (cand.x + cand.w, cand.y + cand.h),
-            (0, 255, 255),
-            1,
+            (0, 255, 0),
+            3,
+        )
+        label = str(idx)
+        (text_w, text_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        top = max(text_h + 8, cand.y)
+        cv2.rectangle(
+            annotated,
+            (cand.x, top - text_h - baseline - 8),
+            (cand.x + text_w + 12, top),
+            (0, 255, 0),
+            -1,
         )
         cv2.putText(
             annotated,
-            str(idx),
-            (cand.x, max(10, cand.y - 2)),
+            label,
+            (cand.x + 6, top - 6),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.35,
-            (0, 0, 255),
-            1,
+            0.55,
+            (255, 255, 255),
+            2,
             cv2.LINE_AA,
         )
     return annotated
