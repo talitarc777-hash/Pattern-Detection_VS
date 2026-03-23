@@ -84,7 +84,6 @@ class _TemplateModel:
     width: int
     height: int
     area: int
-    fill_ratio: float
     aspect_ratio: float
     hu: tuple[float, ...]
     component_count: int
@@ -93,6 +92,7 @@ class _TemplateModel:
     color_weight: float
     ignore_high_saturation: bool
     circularity: float
+    solidity: float
 
 
 @dataclass(frozen=True)
@@ -110,15 +110,12 @@ class _GroupCandidate:
 class _ColorProfile:
     fg_lab_mean: tuple[float, float, float]
     fg_lab_std: tuple[float, float, float]
-    bg_lab_mean: tuple[float, float, float]
-    bg_lab_std: tuple[float, float, float]
     fg_hue_mean: float
     fg_hue_spread: float
     fg_sat_mean: float
     fg_sat_std: float
     fg_chroma_mean: float
     fg_chroma_std: float
-    bg_contrast: float
     chromatic: bool
 
 
@@ -231,13 +228,13 @@ def _build_template_model(template_bgr: np.ndarray) -> _TemplateModel:
     )
     color_profile, color_weight = _template_color_signature(template_crop, union_mask)
     circularity = _mask_circularity(union_mask)
+    solidity = _mask_solidity(union_mask)
 
     return _TemplateModel(
         mask=union_mask,
         width=width,
         height=height,
         area=union_area,
-        fill_ratio=float(union_area) / float(max(1, width * height)),
         aspect_ratio=float(width) / float(max(1, height)),
         hu=_hu_signature(union_mask),
         component_count=len(major_components),
@@ -246,6 +243,7 @@ def _build_template_model(template_bgr: np.ndarray) -> _TemplateModel:
         color_weight=color_weight,
         ignore_high_saturation=ignore_high_saturation,
         circularity=circularity,
+        solidity=solidity,
     )
 
 
@@ -360,11 +358,11 @@ def _prepare_template_image(template_bgr: np.ndarray) -> tuple[np.ndarray, bool]
         comps = _components_from_binary(strong_mask, min_area=max(4, int(round(total_pixels * 0.01))))
         if comps:
             comp = max(comps, key=lambda item: item.area)
-            fill_ratio = float(comp.area) / float(max(1, comp.w * comp.h))
+            coverage = float(comp.area) / float(max(1, comp.w * comp.h))
             center_dx = abs((comp.cx / float(max(1, template_bgr.shape[1]))) - 0.5)
             center_dy = abs((comp.cy / float(max(1, template_bgr.shape[0]))) - 0.5)
             centered = center_dx <= 0.18 and center_dy <= 0.18
-            ring_like = fill_ratio < 0.30 or not centered
+            ring_like = coverage < 0.30 or not centered
 
     ignore_high_saturation = colored_ratio >= 0.06 and sat95 >= 70.0 and ring_like
     if not ignore_high_saturation:
@@ -561,13 +559,17 @@ def _simple_blob_candidates(
             continue
 
         circularity = _mask_circularity(comp.mask)
+        solidity = _mask_solidity(comp.mask)
         circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.35)
         aspect_sim = _ratio_similarity(float(comp.w) / float(max(1, comp.h)), model.aspect_ratio)
-        fill_ratio = float(comp.area) / float(max(1, comp.w * comp.h))
-        fill_sim = max(0.0, 1.0 - abs(fill_ratio - model.fill_ratio) / 0.35)
         color_sim = _color_similarity(image_bgr[comp.y:comp.y + comp.h, comp.x:comp.x + comp.w], model, cfg)
+        if color_sim < color_policy.min_similarity:
+            continue
 
-        score = 0.38 * circ_sim + 0.20 * aspect_sim + 0.22 * fill_sim + 0.20 * color_sim
+        solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.28)
+        shape_score = 0.56 * circ_sim + 0.20 * aspect_sim + 0.24 * solidity_sim
+        color_mix = 0.10 + 0.42 * color_policy.weight
+        score = (1.0 - color_mix) * shape_score + color_mix * color_sim
         if score < min_score:
             continue
 
@@ -740,8 +742,6 @@ def _score_group(
     )
     hu_sim = _similarity_from_distance(_hu_distance(_hu_signature(resized_mask), model.hu), scale=2.4)
     aspect_sim = _ratio_similarity(float(width) / float(height), model.aspect_ratio)
-    fill_ratio = float(union_area) / float(max(1, width * height))
-    fill_sim = max(0.0, 1.0 - abs(fill_ratio - model.fill_ratio) / 0.55)
     layout_sim = _layout_similarity(group, x0, y0, width, height, union_area, model)
     color_policy = _resolve_color_policy(model, cfg)
     color_sim = _color_similarity(image_bgr[y0:y1, x0:x1], model, cfg)
@@ -749,12 +749,11 @@ def _score_group(
         return None
 
     base_score = (
-        0.34 * iou
-        + 0.18 * dilated_iou
-        + 0.18 * hu_sim
-        + 0.12 * aspect_sim
-        + 0.08 * fill_sim
-        + 0.10 * layout_sim
+        0.38 * iou
+        + 0.20 * dilated_iou
+        + 0.20 * hu_sim
+        + 0.10 * aspect_sim
+        + 0.12 * layout_sim
     )
     color_mix = 0.12 + 0.35 * color_policy.weight
     score = (1.0 - color_mix) * base_score + color_mix * color_sim
@@ -839,8 +838,21 @@ def _mask_circularity(mask: np.ndarray) -> float:
     return float(np.clip((4.0 * np.pi * area) / (perimeter * perimeter), 0.0, 1.0))
 
 
+def _mask_solidity(mask: np.ndarray) -> float:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0
+    contour = max(contours, key=cv2.contourArea)
+    hull = cv2.convexHull(contour)
+    hull_area = float(cv2.contourArea(hull))
+    if hull_area <= 0.0:
+        return 0.0
+    pixel_area = float(np.count_nonzero(mask))
+    return float(np.clip(pixel_area / hull_area, 0.0, 1.0))
+
+
 def _effective_min_scale(cfg: DetectionConfig, model: _TemplateModel) -> float:
-    if model.component_count == 1 and model.fill_ratio >= 0.45 and model.circularity >= 0.72:
+    if _is_simple_blob_model(model):
         return min(cfg.min_scale, 0.04)
     return cfg.min_scale
 
@@ -852,7 +864,12 @@ def _effective_num_scales(cfg: DetectionConfig, model: _TemplateModel) -> int:
 
 
 def _is_simple_blob_model(model: _TemplateModel) -> bool:
-    return model.component_count == 1 and model.fill_ratio >= 0.45 and model.circularity >= 0.72
+    return (
+        model.component_count == 1
+        and model.circularity >= 0.72
+        and model.solidity >= 0.62
+        and 0.72 <= model.aspect_ratio <= 1.38
+    )
 
 
 def _resolve_color_policy(model: _TemplateModel, cfg: DetectionConfig) -> _ColorPolicy:
@@ -879,8 +896,8 @@ def _resolve_color_policy(model: _TemplateModel, cfg: DetectionConfig) -> _Color
             min_similarity = 0.18 + 0.28 * weight
             binary_threshold = 0.34 + 0.20 * weight
         else:
-            min_similarity = 0.10 + 0.18 * weight
-            binary_threshold = 0.24 + 0.12 * weight
+            min_similarity = 0.14 + 0.24 * weight
+            binary_threshold = 0.28 + 0.14 * weight
 
     return _ColorPolicy(
         weight=float(np.clip(weight, 0.0, 1.0)),
@@ -896,81 +913,67 @@ def _template_color_signature(
     mask: np.ndarray,
 ) -> tuple[_ColorProfile, float]:
     fg = mask > 0
-    bg = ~fg
     if not np.any(fg):
         neutral = _ColorProfile(
             fg_lab_mean=(128.0, 128.0, 128.0),
             fg_lab_std=(0.0, 0.0, 0.0),
-            bg_lab_mean=(128.0, 128.0, 128.0),
-            bg_lab_std=(0.0, 0.0, 0.0),
             fg_hue_mean=0.0,
             fg_hue_spread=180.0,
             fg_sat_mean=0.0,
             fg_sat_std=0.0,
             fg_chroma_mean=0.0,
             fg_chroma_std=0.0,
-            bg_contrast=0.0,
             chromatic=False,
         )
         return neutral, 0.0
 
-    if not np.any(bg):
-        bg = np.zeros_like(fg, dtype=bool)
-
-    profile = _color_profile_from_masks(template_bgr, fg, bg)
-    chroma_gap = profile.bg_contrast
+    profile = _color_profile_from_mask(template_bgr, fg)
     color_weight = float(
         np.clip(
             max(
                 profile.fg_sat_mean / 90.0,
                 profile.fg_chroma_mean / 18.0,
-                chroma_gap / 22.0,
             ) - 0.12,
             0.0,
             1.0,
         )
     )
     if not profile.chromatic:
-        color_weight *= 0.35
+        lightness_anchor = float(np.clip(abs(profile.fg_lab_mean[0] - 245.0) / 180.0, 0.0, 1.0))
+        neutral_weight = 0.18 + 0.12 * lightness_anchor
+        color_weight = max(color_weight * 0.35, neutral_weight)
     return profile, color_weight
 
 
-def _color_profile_from_masks(image_bgr: np.ndarray, fg: np.ndarray, bg: np.ndarray) -> _ColorProfile:
+def _color_profile_from_mask(image_bgr: np.ndarray, fg: np.ndarray) -> _ColorProfile:
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
     chroma = np.linalg.norm(lab[..., 1:] - np.asarray([128.0, 128.0], dtype=np.float32), axis=2)
 
     fg_lab = lab[fg]
-    bg_lab = lab[bg] if np.any(bg) else lab.reshape(-1, 3)
     fg_h = hsv[..., 0][fg]
     fg_s = hsv[..., 1][fg]
     fg_c = chroma[fg]
 
     fg_lab_mean = tuple(float(v) for v in fg_lab.mean(axis=0))
     fg_lab_std = tuple(float(v) for v in fg_lab.std(axis=0))
-    bg_lab_mean = tuple(float(v) for v in bg_lab.mean(axis=0))
-    bg_lab_std = tuple(float(v) for v in bg_lab.std(axis=0))
     fg_sat_mean = float(fg_s.mean()) if fg_s.size else 0.0
     fg_sat_std = float(fg_s.std()) if fg_s.size else 0.0
     fg_chroma_mean = float(fg_c.mean()) if fg_c.size else 0.0
     fg_chroma_std = float(fg_c.std()) if fg_c.size else 0.0
     fg_hue_mean = _circular_hue_mean(fg_h)
     fg_hue_spread = _circular_hue_spread(fg_h, fg_hue_mean)
-    bg_contrast = float(np.linalg.norm(np.asarray(fg_lab_mean) - np.asarray(bg_lab_mean)))
-    chromatic = bool(fg_sat_mean >= 18.0 or fg_chroma_mean >= 10.0 or bg_contrast >= 9.0)
+    chromatic = bool(fg_sat_mean >= 18.0 or fg_chroma_mean >= 10.0)
 
     return _ColorProfile(
         fg_lab_mean=fg_lab_mean,
         fg_lab_std=fg_lab_std,
-        bg_lab_mean=bg_lab_mean,
-        bg_lab_std=bg_lab_std,
         fg_hue_mean=fg_hue_mean,
         fg_hue_spread=fg_hue_spread,
         fg_sat_mean=fg_sat_mean,
         fg_sat_std=fg_sat_std,
         fg_chroma_mean=fg_chroma_mean,
         fg_chroma_std=fg_chroma_std,
-        bg_contrast=bg_contrast,
         chromatic=chromatic,
     )
 
@@ -984,14 +987,10 @@ def _color_response_map(image_bgr: np.ndarray, model: _TemplateModel, cfg: Detec
 
     fg_mean = np.asarray(profile.fg_lab_mean, dtype=np.float32)
     fg_std = np.asarray(profile.fg_lab_std, dtype=np.float32)
-    bg_mean = np.asarray(profile.bg_lab_mean, dtype=np.float32)
     lab_tol = np.maximum(fg_std * 2.8 + 8.0, np.asarray([10.0, 8.0, 8.0], dtype=np.float32)) * policy.tolerance_scale
-    bg_tol = np.maximum(np.asarray(profile.bg_lab_std, dtype=np.float32) * 2.8 + 10.0, np.asarray([12.0, 10.0, 10.0], dtype=np.float32)) * policy.tolerance_scale
 
     fg_dist = np.sqrt(np.mean(((lab - fg_mean) / lab_tol) ** 2, axis=2))
-    bg_dist = np.sqrt(np.mean(((lab - bg_mean) / bg_tol) ** 2, axis=2))
     lab_score = np.exp(-(fg_dist**2))
-    bg_sep_score = np.clip(0.5 + 0.35 * (bg_dist - fg_dist), 0.0, 1.0)
 
     if profile.chromatic:
         hue_diff = _circular_hue_diff(hsv[..., 0], profile.fg_hue_mean)
@@ -1001,13 +1000,16 @@ def _color_response_map(image_bgr: np.ndarray, model: _TemplateModel, cfg: Detec
         hue_score = np.exp(-((hue_diff / hue_tol) ** 2))
         sat_score = np.exp(-(((hsv[..., 1] - profile.fg_sat_mean) / sat_tol) ** 2))
         chroma_score = np.exp(-(((chroma - profile.fg_chroma_mean) / chroma_tol) ** 2))
-        score = 0.42 * lab_score + 0.18 * bg_sep_score + 0.20 * hue_score + 0.10 * sat_score + 0.10 * chroma_score
+        sat_level = np.clip(hsv[..., 1] / max(profile.fg_sat_mean, 1.0), 0.0, 1.0)
+        chroma_level = np.clip(chroma / max(profile.fg_chroma_mean, 1.0), 0.0, 1.0)
+        presence_gate = 0.25 + 0.75 * (0.5 * sat_level + 0.5 * chroma_level)
+        score = (0.52 * lab_score + 0.20 * hue_score + 0.14 * sat_score + 0.14 * chroma_score) * presence_gate
     else:
         l_tol = max(10.0, profile.fg_lab_std[0] * 2.8 + 10.0) * policy.tolerance_scale
         chroma_tol = max(10.0, profile.fg_chroma_std * 3.0 + 10.0) * policy.tolerance_scale
         light_score = np.exp(-(((lab[..., 0] - profile.fg_lab_mean[0]) / l_tol) ** 2))
         chroma_score = np.exp(-(((chroma - profile.fg_chroma_mean) / chroma_tol) ** 2))
-        score = 0.52 * lab_score + 0.23 * bg_sep_score + 0.15 * light_score + 0.10 * chroma_score
+        score = 0.74 * lab_score + 0.16 * light_score + 0.10 * chroma_score
 
     return np.clip(score.astype(np.float32), 0.0, 1.0)
 
@@ -1015,15 +1017,11 @@ def _color_response_map(image_bgr: np.ndarray, model: _TemplateModel, cfg: Detec
 def _extract_patch_color_profile(candidate_bgr: np.ndarray, model: _TemplateModel) -> _ColorProfile:
     if _is_simple_blob_model(model):
         fg = _candidate_foreground_mask(candidate_bgr)
-        bg = ~fg
-        if not np.any(bg):
-            bg = np.zeros_like(fg, dtype=bool)
-        return _color_profile_from_masks(candidate_bgr, fg, bg)
+        return _color_profile_from_mask(candidate_bgr, fg)
 
     resized = cv2.resize(candidate_bgr, (model.width, model.height), interpolation=cv2.INTER_AREA)
     fg = model.mask > 0
-    bg = ~fg
-    return _color_profile_from_masks(resized, fg, bg)
+    return _color_profile_from_mask(resized, fg)
 
 
 def _candidate_foreground_mask(candidate_bgr: np.ndarray) -> np.ndarray:
@@ -1053,9 +1051,6 @@ def _color_similarity(candidate_bgr: np.ndarray, model: _TemplateModel, cfg: Det
     fg_delta = np.asarray(candidate.fg_lab_mean, dtype=np.float32) - np.asarray(profile.fg_lab_mean, dtype=np.float32)
     lab_score = np.exp(-np.mean((fg_delta / lab_tol) ** 2))
 
-    contrast_tol = max(8.0, profile.bg_contrast * 0.45 + 6.0) * policy.tolerance_scale
-    contrast_score = np.exp(-((candidate.bg_contrast - profile.bg_contrast) / contrast_tol) ** 2)
-
     if profile.chromatic:
         hue_tol = max(10.0, profile.fg_hue_spread * 2.4 + 10.0) * policy.tolerance_scale
         sat_tol = max(12.0, profile.fg_sat_std * 2.8 + 12.0) * policy.tolerance_scale
@@ -1063,13 +1058,16 @@ def _color_similarity(candidate_bgr: np.ndarray, model: _TemplateModel, cfg: Det
         hue_score = np.exp(-(_circular_hue_diff(candidate.fg_hue_mean, profile.fg_hue_mean) / hue_tol) ** 2)
         sat_score = np.exp(-((candidate.fg_sat_mean - profile.fg_sat_mean) / sat_tol) ** 2)
         chroma_score = np.exp(-((candidate.fg_chroma_mean - profile.fg_chroma_mean) / chroma_tol) ** 2)
-        score = 0.42 * lab_score + 0.16 * contrast_score + 0.20 * hue_score + 0.11 * sat_score + 0.11 * chroma_score
+        sat_level = np.clip(candidate.fg_sat_mean / max(profile.fg_sat_mean, 1.0), 0.0, 1.0)
+        chroma_level = np.clip(candidate.fg_chroma_mean / max(profile.fg_chroma_mean, 1.0), 0.0, 1.0)
+        presence_gate = 0.25 + 0.75 * (0.5 * sat_level + 0.5 * chroma_level)
+        score = (0.50 * lab_score + 0.20 * hue_score + 0.15 * sat_score + 0.15 * chroma_score) * presence_gate
     else:
         l_tol = max(10.0, profile.fg_lab_std[0] * 2.8 + 10.0) * policy.tolerance_scale
         chroma_tol = max(10.0, profile.fg_chroma_std * 3.0 + 10.0) * policy.tolerance_scale
         light_score = np.exp(-((candidate.fg_lab_mean[0] - profile.fg_lab_mean[0]) / l_tol) ** 2)
         chroma_score = np.exp(-((candidate.fg_chroma_mean - profile.fg_chroma_mean) / chroma_tol) ** 2)
-        score = 0.54 * lab_score + 0.24 * contrast_score + 0.14 * light_score + 0.08 * chroma_score
+        score = 0.74 * lab_score + 0.16 * light_score + 0.10 * chroma_score
 
     return float(np.clip(score, 0.0, 1.0))
 

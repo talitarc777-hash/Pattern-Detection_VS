@@ -38,6 +38,7 @@ class PatternDetectionApp:
         self.num_scales_var = tk.StringVar(value="12")
         self.mode_var = tk.StringVar(value="Balanced (Recommended)")
         self.detail_var = tk.StringVar(value="Normal")
+        self.color_mode_var = tk.StringVar(value="Auto (Recommended)")
         self.show_advanced_var = tk.BooleanVar(value=False)
         self.last_summary: DetectionSummary | None = None
         self.last_pages: list[np.ndarray] = []
@@ -89,11 +90,19 @@ class PatternDetectionApp:
             row=0,
             col=1,
         )
+        self._add_dropdown_setting(
+            simple,
+            "Color matching:",
+            self.color_mode_var,
+            ["Auto (Recommended)", "Allow More Variation", "Same Color Only (Stricter)"],
+            row=1,
+            col=0,
+        )
         ctk.CTkLabel(
             simple,
-            text="Tip: Start with Balanced + Normal. Change only if results are too many/few.",
+            text="Tip: Start with Balanced + Normal + Auto. Use 'Same Color Only' when real markups share one color.",
             text_color=("gray35", "gray75"),
-        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=12, pady=(2, 8))
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(2, 8))
 
         toggle = ctk.CTkFrame(main, fg_color="transparent")
         toggle.pack(fill="x", pady=(2, 2))
@@ -162,7 +171,7 @@ class PatternDetectionApp:
         ctk.CTkOptionMenu(holder, variable=variable, values=values, width=220).pack(side=tk.LEFT)
         parent.grid_columnconfigure(col, weight=1)
 
-    def _enable_decimal_input(self, entry: ctk.CTkEntry) -> None:
+    def _legacy_enable_decimal_input(self, entry: ctk.CTkEntry) -> None:
         # Some keyboard/layout combinations do not emit "." into CTkEntry.
         # Map decimal-like keys explicitly so numeric fields always accept decimals.
         def insert_dot(event):
@@ -210,6 +219,31 @@ class PatternDetectionApp:
         self.dpi_var.set(dpi)
         self.num_scales_var.set(num_scales)
         self.dark_threshold_var.set("0")
+
+    def _selected_color_sensitivity(self) -> str:
+        mapping = {
+            "Auto (Recommended)": "auto",
+            "Allow More Variation": "soft",
+            "Same Color Only (Stricter)": "strict",
+        }
+        return mapping.get(self.color_mode_var.get(), "auto")
+
+    def _enable_decimal_input(self, entry: ctk.CTkEntry) -> None:
+        # Some keyboard/layout combinations do not emit "." into CTkEntry.
+        # Map decimal-like keys explicitly so numeric fields always accept decimals.
+        def insert_dot(event):
+            entry.insert(tk.INSERT, ".")
+            return "break"
+
+        def map_decimal_keys(event):
+            if event.char in {".", ",", "\u3002", "\uff0e"} or event.keysym in {"period", "KP_Decimal", "decimal", "comma"}:
+                return insert_dot(event)
+            return None
+
+        entry.bind("<KeyPress>", map_decimal_keys)
+        entry.bind("<KeyPress-period>", insert_dot)
+        entry.bind("<KeyPress-KP_Decimal>", insert_dot)
+        entry.bind("<KeyPress-comma>", insert_dot)
 
     def _browse_input(self) -> None:
         file_path = filedialog.askopenfilename(
@@ -298,11 +332,13 @@ class PatternDetectionApp:
                 nms_iou_threshold=float(self.nms_var.get()),
                 num_scales=int(self.num_scales_var.get()),
                 scope=_parse_scope(self.scope_var.get()),
+                color_sensitivity=self._selected_color_sensitivity(),
             )
 
             self._append_log(f"Input: {input_path}")
             self._append_log(f"Template: {template_path}")
             self._append_log(f"Output: {output_dir}")
+            self._append_log(f"Color matching: {self.color_mode_var.get()}")
             self._append_log("Running detection...")
             self.root.update_idletasks()
 
