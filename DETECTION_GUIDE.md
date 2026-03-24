@@ -88,6 +88,7 @@ For grouped component candidates, the score is mainly based on:
 
 For simple blob candidates, the score is mainly based on:
 
+- the dominant inner blob inside the candidate patch
 - circularity
 - aspect ratio
 - solidity
@@ -129,6 +130,7 @@ For simple filled marks, there is also a final blob-specific post-filter after N
 
 That post-filter re-checks:
 
+- the refined inner blob, not just the raw connected component box
 - markup-only color similarity
 - blob-centeredness
 - shape similarity
@@ -265,6 +267,8 @@ Good rule:
 
 This is the smallest allowed size of a candidate relative to the template.
 
+For simple filled marks, this now behaves more like a blob box-size check than a raw filled-area check.
+
 - lower value
   - allows smaller candidates
   - helps when marks on the page are much smaller than the template
@@ -276,6 +280,8 @@ This is the smallest allowed size of a candidate relative to the template.
 ### Max scale
 
 This is the largest allowed size of a candidate relative to the template.
+
+For simple filled marks, this also behaves more like a blob box-size check than a raw filled-area check.
 
 - higher value
   - allows larger candidates

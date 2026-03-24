@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations
 from pathlib import Path
 from typing import Sequence
@@ -100,6 +100,23 @@ class _Component:
     cx: float
     cy: float
     mask: np.ndarray
+
+
+@dataclass(frozen=True)
+class _BlobRefinement:
+    x: int
+    y: int
+    w: int
+    h: int
+    area: int
+    cx: float
+    cy: float
+    mask: np.ndarray
+    circularity: float
+    solidity: float
+    center_dx: float
+    center_dy: float
+    area_ratio: float
 
 
 @dataclass(frozen=True)
@@ -215,6 +232,7 @@ def detect_document_multi(
 
     for page_idx, page_img in enumerate(pages, start=1):
         detect_img, detect_scale = _resize_for_detection(page_img, cfg.max_detection_dim)
+        detect_cfg = _config_for_detect_scale(cfg, detect_scale)
         scope_polygon = _resolve_scope_polygon(detect_img.shape[:2], cfg.scope)
         scope_rect = _polygon_bbox(scope_polygon)
 
@@ -226,10 +244,20 @@ def detect_document_multi(
             detect_view = detect_img[crop_y:crop_y1, crop_x:crop_x1]
 
         per_class_candidates: list[list[Candidate]] = []
-        for model in models:
-            raw = _detect_on_page(detect_view, model, cfg)
+        for class_idx, (class_name, model) in enumerate(zip(class_names, models), start=1):
+            raw = _detect_on_page(detect_view, model, detect_cfg)
             offset = _offset_candidates(raw, crop_x, crop_y)
-            scoped = _filter_candidates_by_scope(offset, scope_polygon, cfg.scope_min_overlap)
+            scoped = _filter_candidates_by_scope(offset, scope_polygon, detect_cfg.scope_min_overlap)
+            if cfg.debug_artifacts and scope_polygon is not None:
+                _export_scope_debug(
+                    debug_dir=debug_dir,
+                    page_idx=page_idx,
+                    class_idx=class_idx,
+                    class_name=class_name,
+                    candidates=offset,
+                    scope_polygon=scope_polygon,
+                    min_overlap=detect_cfg.scope_min_overlap,
+                )
             scaled = _scale_candidates(scoped, 1.0 / detect_scale)
             per_class_candidates.append(scaled)
 
@@ -271,7 +299,7 @@ def detect_document_multi(
                     crop_y=crop_y,
                     page_img=page_img,
                     model=model,
-                    cfg=cfg,
+                    cfg=detect_cfg,
                     final_candidates=per_class_candidates[class_idx - 1],
                 )
         page_results.append(
@@ -794,36 +822,44 @@ def _simple_blob_candidates(
         if comp.w < 3 or comp.h < 3:
             continue
 
-        scale = float(np.sqrt(comp.area / float(max(1, model.area))))
+        patch = image_bgr[comp.y:comp.y + comp.h, comp.x:comp.x + comp.w]
+        refined_result = _refine_blob_candidate(comp.x, comp.y, patch, model)
+        if refined_result is None:
+            continue
+        refined, refined_patch = refined_result
+
+        scale = _blob_scale(model, refined.w, refined.h)
         if scale < effective_min_scale or scale > effective_max_scale:
             continue
 
-        circularity = _mask_circularity(comp.mask)
-        solidity = _mask_solidity(comp.mask)
-        circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.35)
-        aspect_sim = _ratio_similarity(float(comp.w) / float(max(1, comp.h)), model.aspect_ratio)
-        patch = image_bgr[comp.y:comp.y + comp.h, comp.x:comp.x + comp.w]
-        if not _color_family_gate(patch, model, cfg):
+        circularity = refined.circularity
+        solidity = refined.solidity
+        circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.28)
+        aspect_sim = _ratio_similarity(float(refined.w) / float(max(1, refined.h)), model.aspect_ratio)
+        if not _color_family_gate(refined_patch, model, cfg):
             continue
         if not _blob_center_gate(patch, model):
             continue
-        color_sim = _color_similarity(patch, model, cfg)
+        color_sim = _color_similarity(refined_patch, model, cfg)
         if color_sim < color_policy.min_similarity:
             continue
 
-        solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.28)
-        shape_score = 0.56 * circ_sim + 0.20 * aspect_sim + 0.24 * solidity_sim
-        color_mix = 0.10 + 0.42 * color_policy.weight
+        solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.20)
+        size_consistency = float(np.exp(-0.55 * abs(np.log(max(scale, 1e-6)))))
+        shape_score = 0.42 * circ_sim + 0.18 * aspect_sim + 0.22 * solidity_sim + 0.18 * size_consistency
+        if shape_score < max(0.26, min_score - 0.08):
+            continue
+        color_mix = 0.12 + 0.28 * color_policy.weight
         score = (1.0 - color_mix) * shape_score + color_mix * color_sim
         if score < min_score:
             continue
 
         candidates.append(
             _GroupCandidate(
-                x=comp.x,
-                y=comp.y,
-                w=comp.w,
-                h=comp.h,
+                x=refined.x,
+                y=refined.y,
+                w=refined.w,
+                h=refined.h,
                 score=float(score),
                 scale=float(scale),
                 component_ids=(comp.id,),
@@ -871,32 +907,37 @@ def _dense_blob_candidates(
                 continue
 
             patch = image_bgr[comp.y:comp.y + comp.h, comp.x:comp.x + comp.w]
+            refined_result = _refine_blob_candidate(comp.x, comp.y, patch, model)
+            if refined_result is None:
+                continue
+            refined, refined_patch = refined_result
             if not _color_family_gate(patch, model, cfg):
                 continue
             if not _blob_center_gate(patch, model):
                 continue
-            color_sim = _color_similarity(patch, model, cfg)
+            color_sim = _color_similarity(refined_patch, model, cfg)
             if color_sim < max(0.12, policy.min_similarity - 0.14):
                 continue
 
-            circularity = _mask_circularity(comp.mask)
-            solidity = _mask_solidity(comp.mask)
-            aspect_sim = _ratio_similarity(float(comp.w) / float(max(1, comp.h)), model.aspect_ratio)
-            circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.58)
-            solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.46)
+            circularity = refined.circularity
+            solidity = refined.solidity
+            aspect_sim = _ratio_similarity(float(refined.w) / float(max(1, refined.h)), model.aspect_ratio)
+            circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.40)
+            solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.28)
 
-            mean_response = float(np.mean(response[comp.y:comp.y + comp.h, comp.x:comp.x + comp.w][comp.mask > 0]))
-            scale = float(np.sqrt(comp.area / float(max(1, model.area))))
+            refined_response = response[refined.y:refined.y + refined.h, refined.x:refined.x + refined.w]
+            mean_response = float(np.mean(refined_response[refined.mask > 0]))
+            scale = _blob_scale(model, refined.w, refined.h)
             if scale < effective_min_scale or scale > effective_max_scale:
                 continue
 
-            size_consistency = float(np.exp(-0.5 * abs(np.log(max(scale, 1e-6)))))
+            size_consistency = float(np.exp(-0.55 * abs(np.log(max(scale, 1e-6)))))
             score = (
-                0.36 * color_sim
-                + 0.18 * circ_sim
-                + 0.14 * solidity_sim
-                + 0.08 * aspect_sim
-                + 0.10 * size_consistency
+                0.24 * color_sim
+                + 0.22 * circ_sim
+                + 0.16 * solidity_sim
+                + 0.10 * aspect_sim
+                + 0.14 * size_consistency
                 + 0.14 * mean_response
             )
             if score < max(0.22, cfg.match_threshold - 0.20):
@@ -904,10 +945,10 @@ def _dense_blob_candidates(
 
             candidates.append(
                 _GroupCandidate(
-                    x=comp.x,
-                    y=comp.y,
-                    w=comp.w,
-                    h=comp.h,
+                    x=refined.x,
+                    y=refined.y,
+                    w=refined.w,
+                    h=refined.h,
                     score=float(score),
                     scale=float(scale),
                     component_ids=(1000000 * (level_idx + 1) + comp.id,),
@@ -1012,50 +1053,53 @@ def _candidate_from_peak(
     patch = image_bgr[y:y + h, x:x + w]
     if patch.size == 0:
         return None
+    refined_result = _refine_blob_candidate(x, y, patch, model)
+    if refined_result is None:
+        return None
+    refined, refined_patch = refined_result
     if not _color_family_gate(patch, model, cfg):
         return None
     if not _blob_center_gate(patch, model):
         return None
 
-    color_sim = _color_similarity(patch, model, cfg)
+    color_sim = _color_similarity(refined_patch, model, cfg)
     if color_sim < 0.06:
         return None
 
-    scale = float(np.sqrt(area / float(max(1, model.area))))
+    scale = _blob_scale(model, refined.w, refined.h)
     if scale < _effective_min_scale(cfg, model) or scale > _effective_max_scale(cfg, model):
         return None
 
     shape_sim = _shape_similarity(
-        Candidate(x=int(x), y=int(y), w=int(w), h=int(h), score=0.0, angle=0.0, scale=scale),
-        patch,
+        Candidate(x=int(refined.x), y=int(refined.y), w=int(refined.w), h=int(refined.h), score=0.0, angle=0.0, scale=scale),
+        refined_patch,
         model,
     )
     if shape_sim < 0.04:
         return None
 
-    component_mask = np.where(labels[y:y + h, x:x + w] == label_id, 255, 0).astype(np.uint8)
-    circularity = _mask_circularity(component_mask)
-    solidity = _mask_solidity(component_mask)
-    circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.62)
-    solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.52)
-    aspect_sim = _ratio_similarity(float(w) / float(max(1, h)), model.aspect_ratio)
+    circularity = refined.circularity
+    solidity = refined.solidity
+    circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.40)
+    solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.28)
+    aspect_sim = _ratio_similarity(float(refined.w) / float(max(1, refined.h)), model.aspect_ratio)
     center_peak = float(response[peak_y, peak_x])
     size_consistency = float(np.exp(-0.55 * abs(np.log(max(scale, 1e-6)))))
 
     score = (
-        0.22 * color_sim
-        + 0.20 * shape_sim
-        + 0.14 * circ_sim
-        + 0.10 * solidity_sim
+        0.18 * color_sim
+        + 0.22 * shape_sim
+        + 0.16 * circ_sim
+        + 0.12 * solidity_sim
         + 0.08 * aspect_sim
-        + 0.10 * size_consistency
+        + 0.12 * size_consistency
         + 0.16 * center_peak
     )
     return _GroupCandidate(
-        x=int(x),
-        y=int(y),
-        w=int(w),
-        h=int(h),
+        x=int(refined.x),
+        y=int(refined.y),
+        w=int(refined.w),
+        h=int(refined.h),
         score=float(score),
         scale=float(scale),
         component_ids=(component_token,),
@@ -1333,16 +1377,12 @@ def _effective_scale_bounds(cfg: DetectionConfig, model: _TemplateModel) -> tupl
     min_scale = float(cfg.min_scale)
     max_scale = float(cfg.max_scale)
     if _is_simple_blob_model(model):
-        # Tiny filled markups are very sensitive to rasterization.
-        # Give them a little headroom above 1.0 so real dots are not rejected,
-        # while still keeping a meaningful floor against tiny text specks.
-        min_dim = float(max(1, min(model.width, model.height)))
+        # Simple filled marks are sensitive to anti-aliasing and PDF render changes.
+        # Use a relative tolerance band instead of hard-coding around scale=1.0.
         max_dim = float(max(1, max(model.width, model.height)))
-        min_scale = max(min_scale, max(0.22, min(0.45, 3.2 / max_dim)))
-        max_scale = max(max_scale, 1.0 + min(0.22, 2.0 / min_dim))
-        if cfg.uniform_size_assist:
-            min_scale = max(min_scale, 0.62)
-            max_scale = max(max_scale, 1.28)
+        tolerance = 1.0 + min(0.18, 6.0 / max_dim)
+        min_scale = max(0.08, min_scale / tolerance)
+        max_scale = max_scale * tolerance
     if max_scale < min_scale:
         max_scale = min_scale
     return min_scale, max_scale
@@ -1354,6 +1394,13 @@ def _effective_min_scale(cfg: DetectionConfig, model: _TemplateModel) -> float:
 
 def _effective_max_scale(cfg: DetectionConfig, model: _TemplateModel) -> float:
     return _effective_scale_bounds(cfg, model)[1]
+
+
+def _blob_scale(model: _TemplateModel, width: int, height: int) -> float:
+    return 0.5 * (
+        float(width) / float(max(1, model.width))
+        + float(height) / float(max(1, model.height))
+    )
 
 
 def _effective_num_scales(cfg: DetectionConfig, model: _TemplateModel) -> int:
@@ -1623,20 +1670,18 @@ def _shape_similarity(candidate: Candidate, patch: np.ndarray, model: _TemplateM
     if patch.size == 0:
         return 0.0
     if _is_simple_blob_model(model):
-        mask = _dominant_blob_mask(patch, model)
-        if mask is None:
+        blob = _dominant_blob_component(patch, model)
+        if blob is None:
             return 0.0
-        resized = cv2.resize(mask, (model.width, model.height), interpolation=cv2.INTER_NEAREST)
+        resized = cv2.resize(blob.mask, (model.width, model.height), interpolation=cv2.INTER_NEAREST)
         iou = _mask_iou(resized, model.mask)
-        circularity = _mask_circularity(mask)
-        solidity = _mask_solidity(mask)
-        circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.45)
-        solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.34)
-        aspect = float(candidate.w) / float(max(1, candidate.h))
+        circ_sim = max(0.0, 1.0 - abs(blob.circularity - model.circularity) / 0.45)
+        solidity_sim = max(0.0, 1.0 - abs(blob.solidity - model.solidity) / 0.34)
+        aspect = float(blob.w) / float(max(1, blob.h))
         aspect_sim = _ratio_similarity(aspect, model.aspect_ratio)
         size_scale = 0.5 * (
-            float(candidate.w) / float(max(1, model.width))
-            + float(candidate.h) / float(max(1, model.height))
+            float(blob.w) / float(max(1, model.width))
+            + float(blob.h) / float(max(1, model.height))
         )
         size_consistency = float(np.exp(-0.7 * abs(np.log(max(size_scale, 1e-6)))))
         return float(0.34 * iou + 0.24 * circ_sim + 0.18 * solidity_sim + 0.10 * aspect_sim + 0.14 * size_consistency)
@@ -1655,33 +1700,20 @@ def _shape_similarity(candidate: Candidate, patch: np.ndarray, model: _TemplateM
 def _blob_center_gate(candidate_bgr: np.ndarray, model: _TemplateModel) -> bool:
     if model.color_profile.chromatic and not _center_response_gate(candidate_bgr, model):
         return False
-    mask = _dominant_blob_mask(candidate_bgr, model)
-    if mask is None:
+    blob = _dominant_blob_component(candidate_bgr, model)
+    if blob is None:
         return False
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return False
-    contour = max(contours, key=cv2.contourArea)
-    moments = cv2.moments(contour)
-    if moments["m00"] <= 0.0:
+    if blob.center_dx > 0.72 or blob.center_dy > 0.72:
         return False
 
-    h, w = mask.shape[:2]
-    cx = float(moments["m10"] / moments["m00"])
-    cy = float(moments["m01"] / moments["m00"])
-    dx = abs(cx - (w / 2.0)) / float(max(1.0, w / 2.0))
-    dy = abs(cy - (h / 2.0)) / float(max(1.0, h / 2.0))
-    if dx > 0.72 or dy > 0.72:
+    if blob.area_ratio < 0.04:
         return False
 
-    area_ratio = float(np.count_nonzero(mask)) / float(max(1, w * h))
-    if area_ratio < 0.04:
-        return False
-
-    circularity = _mask_circularity(mask)
-    solidity = _mask_solidity(mask)
-    return circularity >= max(0.22, model.circularity - 0.46) and solidity >= max(0.30, model.solidity - 0.42)
+    return (
+        blob.circularity >= max(0.30, model.circularity - 0.38)
+        and blob.solidity >= max(0.45, model.solidity - 0.30)
+    )
 
 
 def _center_response_gate(candidate_bgr: np.ndarray, model: _TemplateModel) -> bool:
@@ -1698,7 +1730,7 @@ def _center_response_gate(candidate_bgr: np.ndarray, model: _TemplateModel) -> b
     return peak_value >= 0.10 and dx <= 0.90 and dy <= 0.90
 
 
-def _dominant_blob_mask(candidate_bgr: np.ndarray, model: _TemplateModel) -> np.ndarray | None:
+def _dominant_blob_component(candidate_bgr: np.ndarray, model: _TemplateModel) -> _BlobRefinement | None:
     fg = _candidate_foreground_mask(candidate_bgr, model)
     binary = np.where(fg, 255, 0).astype(np.uint8)
     components = _components_from_binary(binary, min_area=2)
@@ -1724,7 +1756,63 @@ def _dominant_blob_mask(candidate_bgr: np.ndarray, model: _TemplateModel) -> np.
 
     if best_comp is None:
         return None
-    return best_comp.mask
+    center_dx = abs(float(best_comp.cx) - cx_mid) / float(max(1.0, cx_mid))
+    center_dy = abs(float(best_comp.cy) - cy_mid) / float(max(1.0, cy_mid))
+    area_ratio = float(best_comp.area) / float(max(1, w * h))
+    circularity = _mask_circularity(best_comp.mask)
+    solidity = _mask_solidity(best_comp.mask)
+    return _BlobRefinement(
+        x=best_comp.x,
+        y=best_comp.y,
+        w=best_comp.w,
+        h=best_comp.h,
+        area=best_comp.area,
+        cx=best_comp.cx,
+        cy=best_comp.cy,
+        mask=best_comp.mask,
+        circularity=circularity,
+        solidity=solidity,
+        center_dx=center_dx,
+        center_dy=center_dy,
+        area_ratio=area_ratio,
+    )
+
+
+def _dominant_blob_mask(candidate_bgr: np.ndarray, model: _TemplateModel) -> np.ndarray | None:
+    blob = _dominant_blob_component(candidate_bgr, model)
+    if blob is None:
+        return None
+    return blob.mask
+
+
+def _refine_blob_candidate(
+    base_x: int,
+    base_y: int,
+    patch: np.ndarray,
+    model: _TemplateModel,
+) -> tuple[_BlobRefinement, np.ndarray] | None:
+    blob = _dominant_blob_component(patch, model)
+    if blob is None:
+        return None
+    blob_patch = patch[blob.y:blob.y + blob.h, blob.x:blob.x + blob.w]
+    if blob_patch.size == 0:
+        return None
+    refined = _BlobRefinement(
+        x=base_x + blob.x,
+        y=base_y + blob.y,
+        w=blob.w,
+        h=blob.h,
+        area=blob.area,
+        cx=blob.cx,
+        cy=blob.cy,
+        mask=blob.mask,
+        circularity=blob.circularity,
+        solidity=blob.solidity,
+        center_dx=blob.center_dx,
+        center_dy=blob.center_dy,
+        area_ratio=blob.area_ratio,
+    )
+    return refined, blob_patch
 
 
 def _merge_multi_class_candidates(
@@ -2259,6 +2347,16 @@ def _resize_for_detection(image_bgr: np.ndarray, max_dim: int) -> tuple[np.ndarr
     return resized, scale
 
 
+def _config_for_detect_scale(cfg: DetectionConfig, detect_scale: float) -> DetectionConfig:
+    if abs(detect_scale - 1.0) < 1e-9:
+        return cfg
+    return replace(
+        cfg,
+        min_scale=cfg.min_scale * detect_scale,
+        max_scale=cfg.max_scale * detect_scale,
+    )
+
+
 def _load_pdf_pages(path: Path, dpi: int) -> list[np.ndarray]:
     zoom = float(dpi) / 72.0
     matrix = fitz.Matrix(zoom, zoom)
@@ -2302,6 +2400,53 @@ def _write_debug_table(path: Path, columns: Sequence[str], rows: Sequence[dict[s
     for row in rows:
         lines.append("\t".join(_debug_text(row.get(col, "")) for col in columns))
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _export_scope_debug(
+    debug_dir: Path,
+    page_idx: int,
+    class_idx: int,
+    class_name: str,
+    candidates: Sequence[Candidate],
+    scope_polygon: tuple[tuple[int, int], ...],
+    min_overlap: float,
+) -> None:
+    safe_name = _safe_debug_name(class_name)
+    prefix = f"page{page_idx:03d}_class{class_idx:02d}_{safe_name}"
+    mask = _polygon_mask(scope_polygon)
+    mask_h, mask_w = mask.shape[:2]
+    rows: list[dict[str, object]] = []
+    for idx, cand in enumerate(candidates, start=1):
+        xx1 = max(cand.x, 0)
+        yy1 = max(cand.y, 0)
+        xx2 = min(cand.x + cand.w, mask_w)
+        yy2 = min(cand.y + cand.h, mask_h)
+        overlap_ratio = 0.0
+        decision = "out_of_bounds"
+        if xx2 > xx1 and yy2 > yy1:
+            overlap = int(np.count_nonzero(mask[yy1:yy2, xx1:xx2]))
+            area = max(1, (xx2 - xx1) * (yy2 - yy1))
+            overlap_ratio = float(overlap) / float(area)
+            decision = "kept" if overlap_ratio >= min_overlap else "filtered"
+        rows.append(
+            {
+                "candidate_index": idx,
+                "x": cand.x,
+                "y": cand.y,
+                "w": cand.w,
+                "h": cand.h,
+                "score": cand.score,
+                "scale": cand.scale,
+                "overlap_ratio": overlap_ratio,
+                "min_overlap": min_overlap,
+                "decision": decision,
+            }
+        )
+    _write_debug_table(
+        debug_dir / f"{prefix}_scope_trace.tsv",
+        ("candidate_index", "x", "y", "w", "h", "score", "scale", "overlap_ratio", "min_overlap", "decision"),
+        rows,
+    )
 
 
 def _trace_simple_blob_route(
@@ -2363,20 +2508,38 @@ def _trace_simple_blob_route(
             decision = "area_out_of_range"
         elif comp.w < 3 or comp.h < 3:
             decision = "too_small"
-        elif scale < effective_min_scale or scale > effective_max_scale:
-            decision = "scale_out_of_range"
         else:
             patch = image_bgr[comp.y:comp.y + comp.h, comp.x:comp.x + comp.w]
-            color_family_ok = _color_family_gate(patch, model, cfg)
+            refined_result = _refine_blob_candidate(comp.x, comp.y, patch, model)
+            if refined_result is None:
+                decision = "no_dominant_blob"
+                row["decision"] = decision
+                reason_counts[decision] = reason_counts.get(decision, 0) + 1
+                rows.append(row)
+                continue
+            refined, refined_patch = refined_result
+            scale = _blob_scale(model, refined.w, refined.h)
+            row.update(
+                {
+                    "x": refined.x,
+                    "y": refined.y,
+                    "w": refined.w,
+                    "h": refined.h,
+                    "area": refined.area,
+                    "scale": scale,
+                }
+            )
+            color_family_ok = _color_family_gate(refined_patch, model, cfg)
             center_ok = _blob_center_gate(patch, model) if color_family_ok else False
-            color_sim = _color_similarity(patch, model, cfg) if center_ok else 0.0
-            circularity = _mask_circularity(comp.mask)
-            solidity = _mask_solidity(comp.mask)
-            circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.35)
-            aspect_sim = _ratio_similarity(float(comp.w) / float(max(1, comp.h)), model.aspect_ratio)
-            solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.28)
-            shape_score = 0.56 * circ_sim + 0.20 * aspect_sim + 0.24 * solidity_sim
-            color_mix = 0.10 + 0.42 * color_policy.weight
+            color_sim = _color_similarity(refined_patch, model, cfg) if center_ok else 0.0
+            circularity = refined.circularity
+            solidity = refined.solidity
+            circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.28)
+            aspect_sim = _ratio_similarity(float(refined.w) / float(max(1, refined.h)), model.aspect_ratio)
+            solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.20)
+            size_consistency = float(np.exp(-0.55 * abs(np.log(max(scale, 1e-6)))))
+            shape_score = 0.42 * circ_sim + 0.18 * aspect_sim + 0.22 * solidity_sim + 0.18 * size_consistency
+            color_mix = 0.12 + 0.28 * color_policy.weight
             score = (1.0 - color_mix) * shape_score + color_mix * color_sim
             row.update(
                 {
@@ -2398,17 +2561,21 @@ def _trace_simple_blob_route(
                 decision = "color_family_gate"
             elif not center_ok:
                 decision = "blob_center_gate"
+            elif scale < effective_min_scale or scale > effective_max_scale:
+                decision = "scale_out_of_range"
             elif color_sim < color_policy.min_similarity:
                 decision = "color_similarity_gate"
+            elif shape_score < max(0.26, min_score - 0.08):
+                decision = "shape_gate"
             elif score < min_score:
                 decision = "score_below_threshold"
             else:
                 accepted.append(
                     _GroupCandidate(
-                        x=comp.x,
-                        y=comp.y,
-                        w=comp.w,
-                        h=comp.h,
+                        x=refined.x,
+                        y=refined.y,
+                        w=refined.w,
+                        h=refined.h,
                         score=float(score),
                         scale=float(scale),
                         component_ids=(comp.id,),
@@ -2494,20 +2661,42 @@ def _trace_dense_blob_route(
             else:
                 color_family_ok = _color_family_gate(patch, model, cfg)
                 center_ok = _blob_center_gate(patch, model) if color_family_ok else False
-                color_sim = _color_similarity(patch, model, cfg) if center_ok else 0.0
-                circularity = _mask_circularity(comp.mask)
-                solidity = _mask_solidity(comp.mask)
-                aspect_sim = _ratio_similarity(float(comp.w) / float(max(1, comp.h)), model.aspect_ratio)
-                circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.58)
-                solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.46)
-                mean_response = float(np.mean(response[comp.y:comp.y + comp.h, comp.x:comp.x + comp.w][comp.mask > 0]))
-                size_consistency = float(np.exp(-0.5 * abs(np.log(max(scale, 1e-6)))))
+                refined_result = _refine_blob_candidate(comp.x, comp.y, patch, model) if center_ok else None
+                if refined_result is None:
+                    decision = "no_dominant_blob"
+                    row["decision"] = decision
+                    reason_counts[decision] = reason_counts.get(decision, 0) + 1
+                    rows.append(row)
+                    continue
+                refined, refined_patch = refined_result
+                scale = _blob_scale(model, refined.w, refined.h)
+                row.update(
+                    {
+                        "x": refined.x,
+                        "y": refined.y,
+                        "w": refined.w,
+                        "h": refined.h,
+                        "area": refined.area,
+                        "scale": scale,
+                    }
+                )
+                color_family_ok = _color_family_gate(refined_patch, model, cfg)
+                center_ok = _blob_center_gate(patch, model) if color_family_ok else False
+                color_sim = _color_similarity(refined_patch, model, cfg) if center_ok else 0.0
+                circularity = refined.circularity
+                solidity = refined.solidity
+                aspect_sim = _ratio_similarity(float(refined.w) / float(max(1, refined.h)), model.aspect_ratio)
+                circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.40)
+                solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.28)
+                refined_response = response[refined.y:refined.y + refined.h, refined.x:refined.x + refined.w]
+                mean_response = float(np.mean(refined_response[refined.mask > 0]))
+                size_consistency = float(np.exp(-0.55 * abs(np.log(max(scale, 1e-6)))))
                 score = (
-                    0.36 * color_sim
-                    + 0.18 * circ_sim
-                    + 0.14 * solidity_sim
-                    + 0.08 * aspect_sim
-                    + 0.10 * size_consistency
+                    0.24 * color_sim
+                    + 0.22 * circ_sim
+                    + 0.16 * solidity_sim
+                    + 0.10 * aspect_sim
+                    + 0.14 * size_consistency
                     + 0.14 * mean_response
                 )
                 row.update(
@@ -2540,10 +2729,10 @@ def _trace_dense_blob_route(
                 else:
                     accepted.append(
                         _GroupCandidate(
-                            x=comp.x,
-                            y=comp.y,
-                            w=comp.w,
-                            h=comp.h,
+                            x=refined.x,
+                            y=refined.y,
+                            w=refined.w,
+                            h=refined.h,
                             score=float(score),
                             scale=float(scale),
                             component_ids=(1000000 * level_idx + comp.id,),
@@ -2609,7 +2798,13 @@ def _candidate_from_peak_trace(
     if patch.size == 0:
         row["decision"] = "empty_patch"
         return None, row
-    color_family_ok = _color_family_gate(patch, model, cfg)
+    refined_result = _refine_blob_candidate(x, y, patch, model)
+    if refined_result is None:
+        row["decision"] = "no_dominant_blob"
+        return None, row
+    refined, refined_patch = refined_result
+    row.update({"x": int(refined.x), "y": int(refined.y), "w": int(refined.w), "h": int(refined.h), "area": int(refined.area)})
+    color_family_ok = _color_family_gate(refined_patch, model, cfg)
     row["color_family_ok"] = color_family_ok
     if not color_family_ok:
         row["decision"] = "color_family_gate"
@@ -2620,21 +2815,21 @@ def _candidate_from_peak_trace(
         row["decision"] = "blob_center_gate"
         return None, row
 
-    color_sim = _color_similarity(patch, model, cfg)
+    color_sim = _color_similarity(refined_patch, model, cfg)
     row["color_sim"] = color_sim
     if color_sim < 0.06:
         row["decision"] = "color_similarity_gate"
         return None, row
 
-    scale = float(np.sqrt(area / float(max(1, model.area))))
+    scale = _blob_scale(model, refined.w, refined.h)
     row["scale"] = scale
     if scale < _effective_min_scale(cfg, model) or scale > _effective_max_scale(cfg, model):
         row["decision"] = "scale_out_of_range"
         return None, row
 
     shape_sim = _shape_similarity(
-        Candidate(x=int(x), y=int(y), w=int(w), h=int(h), score=0.0, angle=0.0, scale=scale),
-        patch,
+        Candidate(x=int(refined.x), y=int(refined.y), w=int(refined.w), h=int(refined.h), score=0.0, angle=0.0, scale=scale),
+        refined_patch,
         model,
     )
     row["shape_sim"] = shape_sim
@@ -2642,21 +2837,20 @@ def _candidate_from_peak_trace(
         row["decision"] = "shape_similarity_gate"
         return None, row
 
-    component_mask = np.where(labels[y:y + h, x:x + w] == label_id, 255, 0).astype(np.uint8)
-    circularity = _mask_circularity(component_mask)
-    solidity = _mask_solidity(component_mask)
-    circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.62)
-    solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.52)
-    aspect_sim = _ratio_similarity(float(w) / float(max(1, h)), model.aspect_ratio)
+    circularity = refined.circularity
+    solidity = refined.solidity
+    circ_sim = max(0.0, 1.0 - abs(circularity - model.circularity) / 0.40)
+    solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.28)
+    aspect_sim = _ratio_similarity(float(refined.w) / float(max(1, refined.h)), model.aspect_ratio)
     center_peak = float(response[peak_y, peak_x])
     size_consistency = float(np.exp(-0.55 * abs(np.log(max(scale, 1e-6)))))
     score = (
-        0.22 * color_sim
-        + 0.20 * shape_sim
-        + 0.14 * circ_sim
-        + 0.10 * solidity_sim
+        0.18 * color_sim
+        + 0.22 * shape_sim
+        + 0.16 * circ_sim
+        + 0.12 * solidity_sim
         + 0.08 * aspect_sim
-        + 0.10 * size_consistency
+        + 0.12 * size_consistency
         + 0.16 * center_peak
     )
     row.update(
@@ -2673,10 +2867,10 @@ def _candidate_from_peak_trace(
     row["decision"] = "accepted"
     return (
         _GroupCandidate(
-            x=int(x),
-            y=int(y),
-            w=int(w),
-            h=int(h),
+            x=int(refined.x),
+            y=int(refined.y),
+            w=int(refined.w),
+            h=int(refined.h),
             score=float(score),
             scale=float(scale),
             component_ids=(component_token,),
