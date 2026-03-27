@@ -122,6 +122,7 @@ class _BlobRefinement:
 @dataclass(frozen=True)
 class _TemplateModel:
     mask: np.ndarray
+    gray_template: np.ndarray
     width: int
     height: int
     area: int
@@ -174,6 +175,15 @@ def load_document_pages(path: Path, dpi: int) -> list[np.ndarray]:
     if ext == ".pdf":
         return _load_pdf_pages(path, dpi=dpi)
     return [_imread_unicode(path)]
+
+
+def load_document_page(path: Path, dpi: int, page_index: int = 0) -> np.ndarray:
+    ext = path.suffix.lower()
+    if ext == ".pdf":
+        return _load_pdf_page(path, dpi=dpi, page_index=page_index)
+    if page_index != 0:
+        raise IndexError("Image inputs only contain page 0.")
+    return _imread_unicode(path)
 
 
 def detect_document(
@@ -348,6 +358,7 @@ def _build_template_model(template_bgr: np.ndarray) -> _TemplateModel:
 
     return _TemplateModel(
         mask=union_mask,
+        gray_template=cv2.cvtColor(template_crop, cv2.COLOR_BGR2GRAY),
         width=width,
         height=height,
         area=union_area,
@@ -423,6 +434,15 @@ def _detect_on_page(image_bgr: np.ndarray, model: _TemplateModel, cfg: Detection
         all_candidates.extend(_dense_blob_candidates(working_bgr, model, cfg))
         all_candidates.extend(_centered_blob_proposals(working_bgr, model, cfg))
     else:
+        small_multi_part = model.component_count > 1 and model.area <= 48 and not _is_simple_blob_model(model)
+        if model.component_count == 2 and small_multi_part:
+            all_candidates.extend(_tiny_line_pair_candidates(working_bgr, model, cfg))
+        part_mask = _tiny_line_component_mask(working_bgr, model) if small_multi_part else None
+        focus_mask = _tiny_line_focus_mask(working_bgr, model) if small_multi_part else None
+        if part_mask is not None:
+            focus_components = _filter_page_components(part_mask, model, cfg)
+            if focus_components:
+                all_candidates.extend(_score_candidate_groups(focus_components, working_bgr, model, cfg))
         binaries = [
             _foreground_binary(working_bgr, dark_threshold=cfg.dark_threshold, for_template=False),
             _background_distance_binary(working_bgr),
@@ -443,10 +463,10 @@ def _detect_on_page(image_bgr: np.ndarray, model: _TemplateModel, cfg: Detection
         # --- pixel-level template matching passes (primary signal) ---
         tmpl_mask = model.mask  # already a 2-D uint8 binary
 
-        match_candidates = _template_match_candidates(working_bgr, tmpl_mask, model, cfg)
+        match_candidates = _template_match_candidates(working_bgr, tmpl_mask, model, cfg, focus_mask=focus_mask)
         all_candidates.extend(match_candidates)
 
-        edge_candidates = _edge_match_candidates(working_bgr, tmpl_mask, model, cfg)
+        edge_candidates = _edge_match_candidates(working_bgr, tmpl_mask, model, cfg, focus_mask=focus_mask)
         all_candidates.extend(edge_candidates)
 
     final_candidates = _nms_groups(all_candidates, cfg.nms_iou_threshold)
@@ -460,10 +480,14 @@ def _detect_on_page(image_bgr: np.ndarray, model: _TemplateModel, cfg: Detection
         if filtered is not None:
             filtered_results.append(filtered)
 
+    if filtered_results and _is_simple_blob_model(model):
+        # Filled marks can produce several nearby boxes around the same blob.
+        # Always do a final light dedupe, even when box normalization is off.
+        filtered_results = _dedupe_candidates(filtered_results, min(cfg.nms_iou_threshold, 0.08))
+
     if cfg.uniform_size_assist and filtered_results:
         if _is_simple_blob_model(model):
-            # For filled dots, box normalization can inflate candidates into large overlapping circles
-            # and collapse many true hits into a small count. Keep the detector-sized boxes and only dedupe.
+            filtered_results = _filter_simple_blob_by_anchor_scale(filtered_results, model)
             filtered_results = _dedupe_candidates(filtered_results, min(cfg.nms_iou_threshold, 0.08))
         else:
             filtered_results = _normalize_candidate_boxes(filtered_results, model, image_bgr.shape[:2])
@@ -527,19 +551,24 @@ def _post_filter_candidate(
     color_sim = _color_similarity(cand_bgr, model, cfg) if (color_policy.weight > 0.0 or simple_blob) else 1.0
     min_color_similarity = color_policy.min_similarity if color_policy.weight > 0.0 else 0.0
     acceptance_threshold = cfg.match_threshold
+    hard_color_gate = color_policy.weight > 0.0 and (simple_blob or model.color_profile.chromatic)
     if simple_blob:
         min_color_similarity = max(0.14, color_policy.min_similarity - 0.10)
         acceptance_threshold = max(0.46, cfg.match_threshold)
+    elif not model.color_profile.chromatic:
+        min_color_similarity = 0.0
 
     row["color_sim"] = color_sim
     row["min_color_similarity"] = min_color_similarity
     row["acceptance_threshold"] = acceptance_threshold
 
-    if color_policy.weight > 0.0 and color_sim < min_color_similarity:
+    if hard_color_gate and color_sim < min_color_similarity:
         row["decision"] = "color_similarity_gate"
         return None, row
 
     shape_sim = ""
+    part_sim = ""
+    gray_sim = ""
     size_consistency = ""
     final_score = cand.score
     if simple_blob:
@@ -554,20 +583,108 @@ def _post_filter_candidate(
         if shape_sim < 0.14:
             row["decision"] = "shape_similarity_gate"
             return None, row
+        if _is_dark_neutral_blob_model(model):
+            gray_sim = _gray_patch_similarity(cand_bgr, model)
+            row["gray_sim"] = gray_sim
+            dark_neutral_min_scale = max(min_scale, min(0.45, max(0.32, cfg.min_scale * 2.5)))
+            if box_scale < dark_neutral_min_scale:
+                row["decision"] = "dark_neutral_scale_gate"
+                return None, row
+            if gray_sim < 0.55:
+                row["decision"] = "gray_similarity_gate"
+                return None, row
+            acceptance_threshold = max(0.56, acceptance_threshold)
 
         color_mix = 0.18 + 0.28 * color_policy.weight
         shape_mix = 0.22
         size_mix = 0.14
-        base_mix = max(0.0, 1.0 - color_mix - shape_mix - size_mix)
+        gray_mix = 0.0
+        if _is_dark_neutral_blob_model(model):
+            color_mix = 0.10 + 0.20 * color_policy.weight
+            shape_mix = 0.20
+            size_mix = 0.16
+            gray_mix = 0.16
+        base_mix = max(0.0, 1.0 - color_mix - shape_mix - size_mix - gray_mix)
         final_score = (
             base_mix * cand.score
             + color_mix * color_sim
             + shape_mix * float(shape_sim)
             + size_mix * float(size_consistency)
+            + gray_mix * float(gray_sim or 0.0)
         )
-    elif color_policy.weight > 0.0:
-        color_mix = 0.15 + 0.40 * color_policy.weight
-        final_score = (1.0 - color_mix) * cand.score + color_mix * color_sim
+    else:
+        if _text_like_rejection_gate(cand_bgr):
+            row["decision"] = "text_like_gate"
+            return None, row
+        shape_sim = _shape_similarity(
+            Candidate(x=cand.x, y=cand.y, w=cand.w, h=cand.h, score=cand.score, angle=0.0, scale=box_scale),
+            cand_bgr,
+            model,
+        )
+        edge_sim = _edge_patch_similarity(cand_bgr, model)
+        part_sim = _part_layout_similarity(cand_bgr, model)
+        gray_sim = _gray_patch_similarity(cand_bgr, model)
+        row["shape_sim"] = shape_sim
+        row["edge_sim"] = edge_sim
+        row["part_sim"] = part_sim
+        row["gray_sim"] = gray_sim
+        min_shape = 0.18
+        min_part = 0.0
+        min_gray = 0.0
+        if model.area <= 64 or min(model.width, model.height) <= 12:
+            min_shape = 0.24
+            acceptance_threshold = max(acceptance_threshold, 0.48)
+        if model.component_count > 1 and model.area <= 48:
+            min_shape = max(min_shape, 0.30)
+            min_part = 0.40
+            min_gray = 0.42
+            if edge_sim >= 0.72 and part_sim >= 0.56:
+                min_gray = 0.36
+            acceptance_threshold = max(acceptance_threshold, 0.54)
+        if shape_sim < min_shape:
+            row["decision"] = "shape_similarity_gate"
+            return None, row
+        if part_sim < min_part:
+            row["decision"] = "part_similarity_gate"
+            return None, row
+        if gray_sim < min_gray:
+            row["decision"] = "gray_similarity_gate"
+            return None, row
+
+        small_multi_part = model.component_count > 1 and model.area <= 48
+        if color_policy.weight > 0.0:
+            if small_multi_part:
+                color_mix = 0.08 + 0.14 * color_policy.weight if model.color_profile.chromatic else 0.02 + 0.06 * color_policy.weight
+                edge_mix = 0.17
+                shape_mix = 0.22
+                part_mix = 0.24
+                gray_mix = 0.20
+            else:
+                color_mix = 0.10 + 0.22 * color_policy.weight if model.color_profile.chromatic else 0.04 + 0.10 * color_policy.weight
+                edge_mix = 0.18
+                shape_mix = 0.28
+                part_mix = 0.10 if model.component_count > 1 else 0.0
+                gray_mix = 0.08 if model.area <= 64 else 0.0
+            base_mix = max(0.0, 1.0 - color_mix - edge_mix - shape_mix - part_mix - gray_mix)
+            final_score = (
+                base_mix * cand.score
+                + shape_mix * float(shape_sim)
+                + edge_mix * float(edge_sim)
+                + color_mix * float(color_sim)
+                + part_mix * float(part_sim)
+                + gray_mix * float(gray_sim)
+            )
+        else:
+            if model.component_count > 1 and model.area <= 48:
+                final_score = (
+                    0.18 * cand.score
+                    + 0.22 * float(shape_sim)
+                    + 0.18 * float(edge_sim)
+                    + 0.24 * float(part_sim)
+                    + 0.18 * float(gray_sim)
+                )
+            else:
+                final_score = 0.56 * cand.score + 0.24 * float(shape_sim) + 0.12 * float(edge_sim) + 0.08 * float(part_sim)
 
     row["final_score"] = final_score
     if final_score < acceptance_threshold:
@@ -598,7 +715,14 @@ def _foreground_binary(image_bgr: np.ndarray, dark_threshold: int, for_template:
         color_mask = np.where(color_dist >= max(12.0, float(np.percentile(color_dist, 80))), 255, 0).astype(np.uint8)
         _, gray_mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         binary = cv2.bitwise_or(color_mask, gray_mask)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8))
+        min_dim = min(image_bgr.shape[:2])
+        if min_dim <= 16:
+            if np.count_nonzero(binary) < 6:
+                relaxed_thresh = min(235, int(np.percentile(gray, 30)) + 20)
+                relaxed_dark = np.where(gray <= relaxed_thresh, 255, 0).astype(np.uint8)
+                binary = cv2.bitwise_or(binary, relaxed_dark)
+        else:
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8))
         if np.count_nonzero(binary) < 8:
             binary = np.where(gray < 235, 255, 0).astype(np.uint8)
         return binary
@@ -699,14 +823,65 @@ def _clahe_binary(image_bgr: np.ndarray) -> np.ndarray:
     return cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8))
 
 
+def _tiny_line_component_mask(image_bgr: np.ndarray, model: _TemplateModel) -> np.ndarray:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    base = _foreground_binary(image_bgr, dark_threshold=0, for_template=False)
+    kernel_dim = max(5, int(round(max(model.width, model.height) * 2.0)))
+    kernel_dim = min(kernel_dim | 1, 21)
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, np.ones((kernel_dim, kernel_dim), dtype=np.uint8))
+    bh_threshold = max(6, int(np.percentile(blackhat, 92)))
+    bh_mask = np.where(blackhat >= bh_threshold, 255, 0).astype(np.uint8)
+    combined = cv2.bitwise_or(base, bh_mask)
+
+    max_comp_w = max(3, int(round(model.width * 2.6)))
+    max_comp_h = max(3, int(round(model.height * 3.0)))
+    max_comp_area = max(4, int(round(model.area * 3.8)))
+    min_comp_area = max(1, int(round(model.area * 0.08)))
+    template_parts = _template_part_specs(model)
+
+    filtered = np.zeros_like(combined)
+    for comp in _components_from_binary(combined, min_area=1):
+        if comp.area < min_comp_area or comp.area > max_comp_area:
+            continue
+        if comp.w > max_comp_w or comp.h > max_comp_h:
+            continue
+        if _mask_circularity(comp.mask) >= 0.78 and max(comp.w, comp.h) >= max(model.width, model.height):
+            continue
+        if template_parts and not _component_matches_template_part(comp, template_parts):
+            continue
+        roi = filtered[comp.y:comp.y + comp.h, comp.x:comp.x + comp.w]
+        np.maximum(roi, comp.mask, out=roi)
+
+    if not np.any(filtered):
+        for comp in _components_from_binary(combined, min_area=1):
+            if comp.area < min_comp_area or comp.area > max_comp_area:
+                continue
+            if comp.w > max_comp_w or comp.h > max_comp_h:
+                continue
+            roi = filtered[comp.y:comp.y + comp.h, comp.x:comp.x + comp.w]
+            np.maximum(roi, comp.mask, out=roi)
+
+    return np.where(filtered > 0, 255, 0).astype(np.uint8)
+
+
+def _tiny_line_focus_mask(image_bgr: np.ndarray, model: _TemplateModel) -> np.ndarray:
+    filtered = _tiny_line_component_mask(image_bgr, model)
+    dilate_w = max(2, int(round(model.width * 1.5)))
+    dilate_h = max(2, int(round(model.height * 1.5)))
+    focus = cv2.dilate(filtered, np.ones((dilate_h, dilate_w), dtype=np.uint8))
+    return np.where(focus > 0, 255, 0).astype(np.uint8)
+
+
 def _template_match_candidates(
     image_bgr: np.ndarray,
     tmpl_mask: np.ndarray,
     model: _TemplateModel,
     cfg: DetectionConfig,
+    focus_mask: np.ndarray | None = None,
 ) -> list[_GroupCandidate]:
     """Multi-scale cv2.matchTemplate sweep — pixel-level correlation on grayscale or color-distance map."""
     color_policy = _resolve_color_policy(model, cfg)
+    small_multi_part = model.component_count > 1 and model.area <= 48 and not _is_simple_blob_model(model)
     if color_policy.use_color_map:
         gray = np.clip(_color_response_map(image_bgr, model, cfg) * 255.0, 0, 255).astype(np.uint8)
     else:
@@ -715,7 +890,7 @@ def _template_match_candidates(
     candidates: list[_GroupCandidate] = []
 
     effective_min_scale = _effective_min_scale(cfg, model)
-    tpl_threshold = max(0.28, cfg.match_threshold - 0.10)
+    tpl_threshold = max(0.52, cfg.match_threshold + 0.05) if small_multi_part else max(0.28, cfg.match_threshold - 0.10)
     scales = np.geomspace(effective_min_scale, _effective_max_scale(cfg, model), _effective_num_scales(cfg, model))
 
     for scale in scales:
@@ -726,9 +901,21 @@ def _template_match_candidates(
 
         tmpl_resized = cv2.resize(tmpl_mask, (tw, th), interpolation=cv2.INTER_AREA)
         result = cv2.matchTemplate(gray, tmpl_resized, cv2.TM_CCOEFF_NORMED)
-        locs = np.argwhere(result >= tpl_threshold)
+        peak_mask = result >= tpl_threshold
+        peak_kernel = np.ones((7, 7), dtype=np.float32) if small_multi_part else np.ones((3, 3), dtype=np.float32)
+        local_max = cv2.dilate(result, peak_kernel)
+        peak_mask &= result >= (local_max - 1e-6)
+        if focus_mask is not None:
+            valid = cv2.resize(focus_mask, (result.shape[1], result.shape[0]), interpolation=cv2.INTER_NEAREST)
+            peak_mask &= valid > 0
+        locs = np.argwhere(peak_mask)
+        if small_multi_part and len(locs) > 320:
+            scores = result[locs[:, 0], locs[:, 1]]
+            keep = np.argsort(scores)[-320:]
+            locs = locs[keep]
         for row, col in locs:
             base_score = float(result[row, col])
+            component_token = _synthetic_candidate_token(71, int(col), int(row), tw, th)
             candidates.append(
                 _GroupCandidate(
                     x=int(col),
@@ -737,7 +924,7 @@ def _template_match_candidates(
                     h=th,
                     score=base_score,
                     scale=float(scale),
-                    component_ids=(),
+                    component_ids=(component_token,),
                 )
             )
 
@@ -749,6 +936,7 @@ def _edge_match_candidates(
     tmpl_mask: np.ndarray,
     model: _TemplateModel,
     cfg: DetectionConfig,
+    focus_mask: np.ndarray | None = None,
 ) -> list[_GroupCandidate]:
     """Canny-edge matchTemplate — effective on line-art / CAD drawings."""
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
@@ -756,7 +944,8 @@ def _edge_match_candidates(
     ih, iw = page_edges.shape[:2]
     candidates: list[_GroupCandidate] = []
 
-    tpl_threshold = max(0.25, cfg.match_threshold - 0.15)
+    small_multi_part = model.component_count > 1 and model.area <= 48 and not _is_simple_blob_model(model)
+    tpl_threshold = max(0.50, cfg.match_threshold + 0.03) if small_multi_part else max(0.25, cfg.match_threshold - 0.15)
     scales = np.linspace(_effective_min_scale(cfg, model), _effective_max_scale(cfg, model), max(6, cfg.num_scales // 2))
 
     for scale in scales:
@@ -771,9 +960,21 @@ def _edge_match_candidates(
             continue
 
         result = cv2.matchTemplate(page_edges, tmpl_edges, cv2.TM_CCOEFF_NORMED)
-        locs = np.argwhere(result >= tpl_threshold)
+        peak_mask = result >= tpl_threshold
+        peak_kernel = np.ones((7, 7), dtype=np.float32) if small_multi_part else np.ones((3, 3), dtype=np.float32)
+        local_max = cv2.dilate(result, peak_kernel)
+        peak_mask &= result >= (local_max - 1e-6)
+        if focus_mask is not None:
+            valid = cv2.resize(focus_mask, (result.shape[1], result.shape[0]), interpolation=cv2.INTER_NEAREST)
+            peak_mask &= valid > 0
+        locs = np.argwhere(peak_mask)
+        if small_multi_part and len(locs) > 220:
+            scores = result[locs[:, 0], locs[:, 1]]
+            keep = np.argsort(scores)[-220:]
+            locs = locs[keep]
         for row, col in locs:
             base_score = float(result[row, col]) * 0.90  # slight deflate so shape-matcher wins ties
+            component_token = _synthetic_candidate_token(73, int(col), int(row), tw, th)
             candidates.append(
                 _GroupCandidate(
                     x=int(col),
@@ -782,7 +983,7 @@ def _edge_match_candidates(
                     h=th,
                     score=base_score,
                     scale=float(scale),
-                    component_ids=(),
+                    component_ids=(component_token,),
                 )
             )
 
@@ -811,6 +1012,8 @@ def _simple_blob_candidates(
 
     effective_min_scale = _effective_min_scale(cfg, model)
     effective_max_scale = _effective_max_scale(cfg, model)
+    if _is_dark_neutral_blob_model(model):
+        effective_min_scale = max(effective_min_scale, min(0.45, max(0.32, cfg.min_scale * 2.5)))
     min_area = max(cfg.min_component_area, int(round(model.area * (effective_min_scale**2) * 0.35)))
     max_area = max(cfg.max_component_area, int(round(model.area * (effective_max_scale**2) * 1.2)))
     min_score = max(0.30, cfg.match_threshold - 0.12)
@@ -843,6 +1046,10 @@ def _simple_blob_candidates(
         color_sim = _color_similarity(refined_patch, model, cfg)
         if color_sim < color_policy.min_similarity:
             continue
+        if _is_dark_neutral_blob_model(model):
+            gray_sim = _gray_patch_similarity(refined_patch, model)
+            if gray_sim < 0.52:
+                continue
 
         solidity_sim = max(0.0, 1.0 - abs(solidity - model.solidity) / 0.20)
         size_consistency = float(np.exp(-0.55 * abs(np.log(max(scale, 1e-6)))))
@@ -1115,6 +1322,15 @@ def _estimate_border_background(image_bgr: np.ndarray) -> np.ndarray:
     return np.median(border.astype(np.float32), axis=0)
 
 
+def _synthetic_candidate_token(route_tag: int, x: int, y: int, w: int, h: int) -> int:
+    token = int(route_tag)
+    token = token * 10000 + int(y)
+    token = token * 10000 + int(x)
+    token = token * 100 + int(w)
+    token = token * 100 + int(h)
+    return token
+
+
 def _auto_dark_threshold(gray: np.ndarray) -> int:
     percentile = float(np.percentile(gray, 0.35))
     return int(np.clip(percentile + 18.0, 70.0, 145.0))
@@ -1202,17 +1418,28 @@ def _generate_candidate_groups(
 ) -> list[tuple[_Component, ...]]:
     components = sorted(components, key=lambda comp: comp.cx)
     groups: list[tuple[_Component, ...]] = []
+    small_multi_part = model.component_count > 1 and model.area <= 64 and not _is_simple_blob_model(model)
 
     if model.component_count == 1:
         groups.extend((comp,) for comp in components)
 
     max_span = max(model.width, model.height) * _effective_max_scale(cfg, model) * 2.4
+    y_spread = 0.0
+    if model.parts:
+        y_spread = max(part.cy for part in model.parts) - min(part.cy for part in model.parts)
+    max_y_span = max(
+        max(model.height * _effective_max_scale(cfg, model), 3.0),
+        model.height * _effective_max_scale(cfg, model) * (1.2 + 1.6 * y_spread),
+    )
     for idx, anchor in enumerate(components):
         neighbors: list[_Component] = []
         for other in components[idx + 1 :]:
             if other.x - anchor.x > max_span:
                 break
-            if abs(other.cy - anchor.cy) > max(anchor.h, other.h, model.height * _effective_max_scale(cfg, model)):
+            if small_multi_part:
+                if abs(other.cy - anchor.cy) > max_y_span:
+                    continue
+            elif abs(other.cy - anchor.cy) > max(anchor.h, other.h, model.height * _effective_max_scale(cfg, model)):
                 continue
             neighbors.append(other)
             if len(neighbors) >= cfg.max_neighbors:
@@ -1267,17 +1494,37 @@ def _score_group(
     if not _color_family_gate(patch, model, cfg):
         return None
     color_sim = _color_similarity(patch, model, cfg)
-    if color_sim < color_policy.min_similarity:
+    if model.color_profile.chromatic and color_sim < color_policy.min_similarity:
         return None
 
-    base_score = (
-        0.38 * iou
-        + 0.20 * dilated_iou
-        + 0.20 * hu_sim
-        + 0.10 * aspect_sim
-        + 0.12 * layout_sim
-    )
-    color_mix = 0.12 + 0.35 * color_policy.weight
+    small_multi_part = model.component_count > 1 and model.area <= 48 and not _is_simple_blob_model(model)
+    part_sim = 1.0
+    gray_sim = 1.0
+    if small_multi_part:
+        part_sim = _part_layout_similarity(patch, model)
+        gray_sim = _gray_patch_similarity(patch, model)
+        if layout_sim < 0.28 or part_sim < 0.34 or gray_sim < 0.38:
+            return None
+
+    if small_multi_part:
+        base_score = (
+            0.22 * iou
+            + 0.15 * dilated_iou
+            + 0.14 * hu_sim
+            + 0.08 * aspect_sim
+            + 0.18 * layout_sim
+            + 0.13 * part_sim
+            + 0.10 * gray_sim
+        )
+    else:
+        base_score = (
+            0.38 * iou
+            + 0.20 * dilated_iou
+            + 0.20 * hu_sim
+            + 0.10 * aspect_sim
+            + 0.12 * layout_sim
+        )
+    color_mix = 0.12 + 0.35 * color_policy.weight if model.color_profile.chromatic else 0.04 + 0.10 * color_policy.weight
     score = (1.0 - color_mix) * base_score + color_mix * color_sim
     if score < cfg.match_threshold:
         return None
@@ -1373,6 +1620,162 @@ def _mask_solidity(mask: np.ndarray) -> float:
     return float(np.clip(pixel_area / hull_area, 0.0, 1.0))
 
 
+def _mask_orientation_deg(mask: np.ndarray) -> float | None:
+    ys, xs = np.where(mask > 0)
+    if xs.size < 2:
+        return None
+    pts = np.column_stack((xs.astype(np.float32), ys.astype(np.float32)))
+    pts -= np.mean(pts, axis=0, keepdims=True)
+    cov = np.cov(pts, rowvar=False)
+    if cov.shape != (2, 2):
+        return None
+    vals, vecs = np.linalg.eigh(cov)
+    axis = vecs[:, int(np.argmax(vals))]
+    return float(np.degrees(np.arctan2(axis[1], axis[0])))
+
+
+def _axial_angle_diff_deg(a: float, b: float) -> float:
+    diff = abs((a - b + 90.0) % 180.0 - 90.0)
+    return float(abs(diff))
+
+
+def _template_part_specs(model: _TemplateModel) -> list[tuple[float, float, float | None]]:
+    if not model.parts:
+        return []
+    comps = _components_from_binary(model.mask, min_area=1)
+    selected = _select_template_components(comps, model.mask.shape[:2])
+    if not selected:
+        return []
+    specs: list[tuple[float, float, float | None]] = []
+    for comp in sorted(selected, key=lambda comp: comp.cx):
+        specs.append((float(comp.w), float(comp.h), _mask_orientation_deg(comp.mask)))
+    return specs
+
+
+def _component_matches_template_part(
+    comp: _Component,
+    template_parts: Sequence[tuple[float, float, float | None]],
+) -> bool:
+    fill = float(comp.area) / float(max(1, comp.w * comp.h))
+    if fill < 0.22:
+        return False
+
+    comp_aspect = float(comp.w) / float(max(1, comp.h))
+    comp_angle = _mask_orientation_deg(comp.mask)
+    for part_w, part_h, part_angle in template_parts:
+        scale_w = float(comp.w) / float(max(1.0, part_w))
+        scale_h = float(comp.h) / float(max(1.0, part_h))
+        if min(scale_w, scale_h) < 0.38 or max(scale_w, scale_h) > 1.85:
+            continue
+        target_aspect = part_w / float(max(1.0, part_h))
+        if _ratio_similarity(comp_aspect, target_aspect) < 0.55:
+            continue
+        if comp_angle is not None and part_angle is not None and _axial_angle_diff_deg(comp_angle, part_angle) > 22.0:
+            continue
+        return True
+    return False
+
+
+def _select_tiny_line_components(candidate_bgr: np.ndarray, model: _TemplateModel) -> list[_Component]:
+    mask = _tiny_line_component_mask(candidate_bgr, model)
+    components = _components_from_binary(mask, min_area=1)
+    if not components:
+        return []
+
+    template_parts = _template_part_specs(model)
+    matching = [comp for comp in components if not template_parts or _component_matches_template_part(comp, template_parts)]
+    if not matching:
+        matching = components
+
+    matching = sorted(matching, key=lambda comp: (comp.area, -comp.y), reverse=True)[:8]
+    target_count = max(1, model.component_count)
+    if len(matching) <= target_count:
+        return sorted(matching, key=lambda comp: comp.cx)
+
+    best_subset: tuple[_Component, ...] | None = None
+    best_score = -1.0
+    for subset in combinations(matching, target_count):
+        x0, y0, x1, y1 = _group_bbox(subset)
+        union_mask = _render_group_mask(subset, x0, y0, x1 - x0, y1 - y0)
+        union_area = int(np.count_nonzero(union_mask))
+        if union_area == 0:
+            continue
+        layout = _layout_similarity(subset, x0, y0, x1 - x0, y1 - y0, union_area, model)
+        area = float(sum(comp.area for comp in subset))
+        total_area = float(sum(comp.area for comp in matching))
+        cleanliness = float(np.clip(area / max(1.0, total_area), 0.0, 1.0))
+        score = 0.78 * layout + 0.22 * cleanliness
+        if score > best_score:
+            best_score = score
+            best_subset = subset
+
+    if best_subset is None:
+        return sorted(matching[:target_count], key=lambda comp: comp.cx)
+    return sorted(best_subset, key=lambda comp: comp.cx)
+
+
+def _tiny_line_pair_candidates(
+    image_bgr: np.ndarray,
+    model: _TemplateModel,
+    cfg: DetectionConfig,
+) -> list[_GroupCandidate]:
+    if model.component_count != 2 or model.area > 48 or _is_simple_blob_model(model):
+        return []
+
+    part_mask = _tiny_line_component_mask(image_bgr, model)
+    components = _components_from_binary(part_mask, min_area=1)
+    if len(components) < 2:
+        return []
+
+    template_parts = _template_part_specs(model)
+    if template_parts:
+        components = [comp for comp in components if _component_matches_template_part(comp, template_parts)]
+    if len(components) < 2:
+        return []
+
+    components = sorted(components, key=lambda comp: comp.cx)
+    expected_dx = abs(model.parts[1].cx - model.parts[0].cx)
+    expected_dy = abs(model.parts[1].cy - model.parts[0].cy)
+    max_span = max(model.width, model.height) * _effective_max_scale(cfg, model) * 1.6
+    candidates: list[_GroupCandidate] = []
+    seen_groups: set[tuple[int, int]] = set()
+
+    for idx, anchor in enumerate(components):
+        for other in components[idx + 1 :]:
+            if other.x - anchor.x > max_span:
+                break
+            group_ids = (anchor.id, other.id)
+            if group_ids in seen_groups:
+                continue
+            seen_groups.add(group_ids)
+
+            height_sim = _ratio_similarity(float(anchor.h), float(other.h))
+            width_sim = _ratio_similarity(float(anchor.w), float(other.w))
+            if height_sim < 0.58 or width_sim < 0.48:
+                continue
+
+            overlap_y = max(0, min(anchor.y + anchor.h, other.y + other.h) - max(anchor.y, other.y))
+            overlap_ratio = float(overlap_y) / float(max(1, min(anchor.h, other.h)))
+            if overlap_ratio < 0.42:
+                continue
+
+            x0, y0, x1, y1 = _group_bbox((anchor, other))
+            width = float(max(1, x1 - x0))
+            height = float(max(1, y1 - y0))
+            dx_norm = abs(other.cx - anchor.cx) / width
+            dy_norm = abs(other.cy - anchor.cy) / height
+            if abs(dx_norm - expected_dx) > 0.34:
+                continue
+            if abs(dy_norm - expected_dy) > 0.28:
+                continue
+
+            candidate = _score_group((anchor, other), image_bgr, model, cfg)
+            if candidate is not None:
+                candidates.append(candidate)
+
+    return candidates
+
+
 def _effective_scale_bounds(cfg: DetectionConfig, model: _TemplateModel) -> tuple[float, float]:
     min_scale = float(cfg.min_scale)
     max_scale = float(cfg.max_scale)
@@ -1383,6 +1786,13 @@ def _effective_scale_bounds(cfg: DetectionConfig, model: _TemplateModel) -> tupl
         tolerance = 1.0 + min(0.18, 6.0 / max_dim)
         min_scale = max(0.08, min_scale / tolerance)
         max_scale = max_scale * tolerance
+    elif model.component_count > 1 and model.area <= 32:
+        # Tiny line-like templates can shrink noticeably on poor PDFs.
+        # Allow a modest tolerance band so degraded renderings still enter scoring.
+        max_dim = float(max(1, max(model.width, model.height)))
+        tolerance = 1.0 + min(0.25, 8.0 / max_dim)
+        min_scale = max(0.10, min_scale / tolerance)
+        max_scale = max_scale * min(1.18, tolerance)
     if max_scale < min_scale:
         max_scale = min_scale
     return min_scale, max_scale
@@ -1409,12 +1819,46 @@ def _effective_num_scales(cfg: DetectionConfig, model: _TemplateModel) -> int:
     return cfg.num_scales
 
 
+def _filter_simple_blob_by_anchor_scale(
+    candidates: Sequence[Candidate],
+    model: _TemplateModel,
+) -> list[Candidate]:
+    if len(candidates) <= 2:
+        return list(candidates)
+
+    anchor = max(candidates, key=lambda cand: cand.score).scale
+    tolerance = 0.30
+    if not model.color_profile.chromatic and model.area <= 48:
+        tolerance = 0.22
+    elif not model.color_profile.chromatic:
+        tolerance = 0.26
+
+    min_scale = anchor * (1.0 - tolerance)
+    max_scale = anchor * (1.0 + tolerance)
+    kept = [cand for cand in candidates if min_scale <= cand.scale <= max_scale]
+    return kept or list(candidates)
+
+
 def _is_simple_blob_model(model: _TemplateModel) -> bool:
     return (
-        model.component_count == 1
+        model.area >= 12
+        and min(model.width, model.height) >= 4
+        and model.component_count == 1
         and model.circularity >= 0.56
         and model.solidity >= 0.55
         and 0.62 <= model.aspect_ratio <= 1.55
+    )
+
+
+def _is_dark_neutral_blob_model(model: _TemplateModel) -> bool:
+    profile = model.color_profile
+    return (
+        _is_simple_blob_model(model)
+        and not profile.chromatic
+        and profile.fg_lab_mean[0] <= 80.0
+        and profile.fg_sat_mean <= 12.0
+        and profile.fg_chroma_mean <= 6.0
+        and model.area >= 96
     )
 
 
@@ -1474,16 +1918,9 @@ def _template_color_signature(
         return neutral, 0.0
 
     profile = _color_profile_from_mask(template_bgr, fg)
-    color_weight = float(
-        np.clip(
-            max(
-                profile.fg_sat_mean / 90.0,
-                profile.fg_chroma_mean / 18.0,
-            ) - 0.12,
-            0.0,
-            1.0,
-        )
-    )
+    sat_signal = float(np.clip(profile.fg_sat_mean / 120.0, 0.0, 1.0))
+    chroma_signal = float(np.clip(profile.fg_chroma_mean / 18.0, 0.0, 1.0))
+    color_weight = float(np.clip(0.25 * sat_signal + 0.75 * chroma_signal - 0.08, 0.0, 1.0))
     if not profile.chromatic:
         lightness_anchor = float(np.clip(abs(profile.fg_lab_mean[0] - 245.0) / 180.0, 0.0, 1.0))
         neutral_weight = 0.18 + 0.12 * lightness_anchor
@@ -1499,6 +1936,7 @@ def _color_profile_from_mask(image_bgr: np.ndarray, fg: np.ndarray) -> _ColorPro
     fg_lab = lab[fg]
     fg_h = hsv[..., 0][fg]
     fg_s = hsv[..., 1][fg]
+    fg_v = hsv[..., 2][fg]
     fg_c = chroma[fg]
 
     fg_lab_mean = tuple(float(v) for v in fg_lab.mean(axis=0))
@@ -1509,7 +1947,11 @@ def _color_profile_from_mask(image_bgr: np.ndarray, fg: np.ndarray) -> _ColorPro
     fg_chroma_std = float(fg_c.std()) if fg_c.size else 0.0
     fg_hue_mean = _circular_hue_mean(fg_h)
     fg_hue_spread = _circular_hue_spread(fg_h, fg_hue_mean)
-    chromatic = bool(fg_sat_mean >= 18.0 or fg_chroma_mean >= 10.0)
+    fg_value_mean = float(fg_v.mean()) if fg_v.size else 0.0
+    chromatic = bool(
+        fg_chroma_mean >= 12.0
+        or ((fg_sat_mean >= 24.0 or fg_value_mean >= 70.0) and fg_chroma_mean >= 6.0)
+    )
 
     return _ColorProfile(
         fg_lab_mean=fg_lab_mean,
@@ -1689,12 +2131,108 @@ def _shape_similarity(candidate: Candidate, patch: np.ndarray, model: _TemplateM
     resized = cv2.resize(patch, (model.width, model.height), interpolation=cv2.INTER_AREA)
     mask = _foreground_binary(resized, dark_threshold=0, for_template=True)
     iou = _mask_iou(mask, model.mask)
+    dilated_iou = _mask_iou(
+        cv2.dilate(mask, np.ones((2, 2), dtype=np.uint8)),
+        cv2.dilate(model.mask, np.ones((2, 2), dtype=np.uint8)),
+    )
     hu_sim = _similarity_from_distance(_hu_distance(_hu_signature(mask), model.hu), scale=2.5)
     aspect = float(candidate.w) / float(max(1, candidate.h))
     aspect_sim = _ratio_similarity(aspect, model.aspect_ratio)
     size_scale = 0.5 * (float(candidate.w) / float(max(1, model.width)) + float(candidate.h) / float(max(1, model.height)))
     size_consistency = float(np.exp(-0.7 * abs(np.log(max(size_scale, 1e-6)))))
-    return float(0.40 * iou + 0.25 * hu_sim + 0.15 * aspect_sim + 0.20 * size_consistency)
+    return float(0.28 * iou + 0.18 * dilated_iou + 0.22 * hu_sim + 0.12 * aspect_sim + 0.20 * size_consistency)
+
+
+def _gray_patch_similarity(candidate_bgr: np.ndarray, model: _TemplateModel) -> float:
+    if candidate_bgr.size == 0:
+        return 0.0
+    if model.component_count > 1 and model.area <= 48 and not _is_simple_blob_model(model):
+        selected = _select_tiny_line_components(candidate_bgr, model)
+        if not selected:
+            return 0.0
+        x0, y0, x1, y1 = _group_bbox(selected)
+        union_mask = _render_group_mask(selected, x0, y0, x1 - x0, y1 - y0)
+        resized_mask = cv2.resize(union_mask, (model.width, model.height), interpolation=cv2.INTER_NEAREST)
+        resized_mask = np.where(resized_mask > 0, 255, 0).astype(np.uint8)
+        iou = _mask_iou(resized_mask, model.mask)
+        dilated_iou = _mask_iou(
+            cv2.dilate(resized_mask, np.ones((3, 3), dtype=np.uint8)),
+            cv2.dilate(model.mask, np.ones((3, 3), dtype=np.uint8)),
+        )
+        gray = cv2.cvtColor(candidate_bgr, cv2.COLOR_BGR2GRAY)
+        patch_fg = gray[y0:y1, x0:x1][union_mask > 0]
+        tmpl_fg = model.gray_template[model.mask > 0]
+        cand_dark = 1.0 - float(np.mean(patch_fg)) / 255.0 if patch_fg.size else 0.0
+        tmpl_dark = 1.0 - float(np.mean(tmpl_fg)) / 255.0 if tmpl_fg.size else cand_dark
+        dark_sim = float(np.clip(1.0 - abs(cand_dark - tmpl_dark) / 0.45, 0.0, 1.0))
+        return float(0.48 * iou + 0.32 * dilated_iou + 0.20 * dark_sim)
+
+    gray = cv2.cvtColor(candidate_bgr, cv2.COLOR_BGR2GRAY)
+    resized = cv2.resize(gray, (model.width, model.height), interpolation=cv2.INTER_AREA)
+    tmpl = model.gray_template
+    if resized.shape != tmpl.shape:
+        return 0.0
+
+    corr = float(cv2.matchTemplate(resized, tmpl, cv2.TM_CCOEFF_NORMED)[0, 0])
+    corr_score = float(np.clip((corr + 1.0) * 0.5, 0.0, 1.0))
+    blur_resized = cv2.GaussianBlur(resized, (3, 3), 0)
+    blur_tmpl = cv2.GaussianBlur(tmpl, (3, 3), 0)
+    blur_corr = float(cv2.matchTemplate(blur_resized, blur_tmpl, cv2.TM_CCOEFF_NORMED)[0, 0])
+    blur_corr_score = float(np.clip((blur_corr + 1.0) * 0.5, 0.0, 1.0))
+
+    mask = model.mask > 0
+    tmpl_f = tmpl.astype(np.float32)
+    resized_f = resized.astype(np.float32)
+    fg_diff = float(np.mean(np.abs(resized_f[mask] - tmpl_f[mask]))) if np.any(mask) else 255.0
+    bg_mask = ~mask
+    bg_diff = float(np.mean(np.abs(resized_f[bg_mask] - tmpl_f[bg_mask]))) if np.any(bg_mask) else fg_diff
+    fg_score = float(np.clip(1.0 - fg_diff / 110.0, 0.0, 1.0))
+    bg_score = float(np.clip(1.0 - bg_diff / 140.0, 0.0, 1.0))
+    return float(0.28 * corr_score + 0.22 * blur_corr_score + 0.30 * fg_score + 0.20 * bg_score)
+
+
+def _part_layout_similarity(candidate_bgr: np.ndarray, model: _TemplateModel) -> float:
+    if candidate_bgr.size == 0:
+        return 0.0
+    if model.component_count > 1 and model.area <= 48 and not _is_simple_blob_model(model):
+        selected = _select_tiny_line_components(candidate_bgr, model)
+        components = selected
+    else:
+        resized = cv2.resize(candidate_bgr, (model.width, model.height), interpolation=cv2.INTER_AREA)
+        mask = _foreground_binary(resized, dark_threshold=0, for_template=True)
+        components = _components_from_binary(mask, min_area=1)
+        if not components:
+            return 0.0
+        selected = _select_template_components(components, mask.shape[:2])
+    if not selected:
+        return 0.0
+    x0, y0, x1, y1 = _group_bbox(selected)
+    union_mask = _render_group_mask(selected, x0, y0, x1 - x0, y1 - y0)
+    union_area = int(np.count_nonzero(union_mask))
+    if union_area == 0:
+        return 0.0
+
+    layout = _layout_similarity(selected, x0, y0, x1 - x0, y1 - y0, union_area, model)
+    count_delta = abs(len(selected) - model.component_count)
+    count_sim = float(np.exp(-0.95 * count_delta))
+    total_area = float(sum(comp.area for comp in components))
+    selected_area = float(sum(comp.area for comp in selected))
+    cleanliness = float(np.clip(selected_area / max(1.0, total_area), 0.0, 1.0))
+    return float(0.56 * layout + 0.24 * count_sim + 0.20 * cleanliness)
+
+
+def _edge_patch_similarity(candidate_bgr: np.ndarray, model: _TemplateModel) -> float:
+    if candidate_bgr.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(candidate_bgr, cv2.COLOR_BGR2GRAY)
+    resized = cv2.resize(gray, (model.width, model.height), interpolation=cv2.INTER_AREA)
+    cand_edges = cv2.Canny(resized, 30, 100)
+    tmpl_edges = cv2.Canny(model.mask, 30, 100)
+    if not np.any(tmpl_edges):
+        tmpl_edges = model.mask.copy()
+    cand_edges = cv2.dilate(cand_edges, np.ones((2, 2), dtype=np.uint8))
+    tmpl_edges = cv2.dilate(tmpl_edges, np.ones((2, 2), dtype=np.uint8))
+    return _mask_iou(cand_edges, tmpl_edges)
 
 
 def _blob_center_gate(candidate_bgr: np.ndarray, model: _TemplateModel) -> bool:
@@ -2042,14 +2580,15 @@ def _nms_groups(candidates: Sequence[_GroupCandidate], iou_threshold: float) -> 
     used_component_sets: set[tuple[int, ...]] = set()
 
     for cand in ordered:
-        if cand.component_ids in used_component_sets:
+        if cand.component_ids and cand.component_ids in used_component_sets:
             continue
 
         if any(_group_iou(cand, prev) >= iou_threshold or _group_center_too_close(cand, prev) for prev in kept):
             continue
 
         kept.append(cand)
-        used_component_sets.add(cand.component_ids)
+        if cand.component_ids:
+            used_component_sets.add(cand.component_ids)
 
     return kept
 
@@ -2075,7 +2614,7 @@ def _group_center_too_close(a: _GroupCandidate, b: _GroupCandidate) -> bool:
     by = b.y + b.h / 2.0
     dist = float(np.hypot(ax - bx, ay - by))
     min_dim = float(min(a.w, a.h, b.w, b.h))
-    return dist < 0.9 * min_dim
+    return dist <= max(2.0, 1.25 * min_dim)
 
 
 def _normalize_candidate_boxes(
@@ -2369,6 +2908,19 @@ def _load_pdf_pages(path: Path, dpi: int) -> list[np.ndarray]:
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             pages.append(bgr)
     return pages
+
+
+def _load_pdf_page(path: Path, dpi: int, page_index: int) -> np.ndarray:
+    zoom = float(dpi) / 72.0
+    matrix = fitz.Matrix(zoom, zoom)
+    with fitz.open(path) as pdf:
+        if page_index < 0 or page_index >= len(pdf):
+            raise IndexError(f"PDF page index out of range: {page_index}")
+        page = pdf[page_index]
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+    buffer = np.frombuffer(pix.samples, dtype=np.uint8)
+    rgb = buffer.reshape((pix.height, pix.width, pix.n))
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
 def _imread_unicode(path: Path) -> np.ndarray:
@@ -2977,7 +3529,7 @@ def _nms_groups_trace(
     suppressed: dict[int, str] = {}
 
     for idx, cand in ordered:
-        if cand.component_ids in used_component_sets:
+        if cand.component_ids and cand.component_ids in used_component_sets:
             suppressed[idx] = "duplicate_component_ids"
             continue
 
@@ -2995,7 +3547,8 @@ def _nms_groups_trace(
 
         kept.append((idx, cand))
         kept_indices.add(idx)
-        used_component_sets.add(cand.component_ids)
+        if cand.component_ids:
+            used_component_sets.add(cand.component_ids)
 
     return kept_indices, suppressed
 
@@ -3209,6 +3762,9 @@ def _export_page_debug(
                     "color_sim": detail.get("color_sim", ""),
                     "min_color_similarity": detail.get("min_color_similarity", ""),
                     "shape_sim": detail.get("shape_sim", ""),
+                    "edge_sim": detail.get("edge_sim", ""),
+                    "part_sim": detail.get("part_sim", ""),
+                    "gray_sim": detail.get("gray_sim", ""),
                     "size_consistency": detail.get("size_consistency", ""),
                     "acceptance_threshold": detail.get("acceptance_threshold", ""),
                     "final_score": detail.get("final_score", ""),
@@ -3221,7 +3777,7 @@ def _export_page_debug(
             (
                 "proposal_index", "route", "x", "y", "w", "h", "base_score", "scale", "box_scale",
                 "effective_min_scale", "effective_max_scale", "color_family_ok", "center_ok",
-                "color_sim", "min_color_similarity", "shape_sim", "size_consistency",
+                "color_sim", "min_color_similarity", "shape_sim", "edge_sim", "part_sim", "gray_sim", "size_consistency",
                 "acceptance_threshold", "final_score", "decision", "matches_final_output",
             ),
             post_filter_rows,
@@ -3237,13 +3793,214 @@ def _export_page_debug(
         for reason, count in sorted(post_filter_reason_counts.items()):
             summary_lines.append(f"post_filter_{reason}={count}")
     else:
+        color_policy = _resolve_color_policy(model, cfg)
+        small_multi_part = model.component_count > 1 and model.area <= 48 and not _is_simple_blob_model(model)
+        part_mask = _tiny_line_component_mask(detect_view, model) if small_multi_part else None
+        focus_mask = _tiny_line_focus_mask(detect_view, model) if small_multi_part else None
+        binaries = [
+            _foreground_binary(detect_view, dark_threshold=cfg.dark_threshold, for_template=False),
+            _background_distance_binary(detect_view),
+            _adaptive_color_binary(detect_view),
+            _clahe_binary(detect_view),
+        ]
+        if color_policy.use_color_map:
+            binaries.append(_template_color_binary(detect_view, model, cfg))
+
+        group_candidates: list[_GroupCandidate] = []
+        group_rows: list[dict[str, object]] = []
+        if model.component_count == 2 and small_multi_part:
+            pair_candidates = _tiny_line_pair_candidates(detect_view, model, cfg)
+            summary_lines.append(f"tiny_line_pair_candidates={len(pair_candidates)}")
+            for cand in pair_candidates:
+                group_rows.append(
+                    {
+                        "route": "group_pair",
+                        "x": cand.x,
+                        "y": cand.y,
+                        "w": cand.w,
+                        "h": cand.h,
+                        "score": cand.score,
+                        "scale": cand.scale,
+                    }
+                )
+            group_candidates.extend(pair_candidates)
+        if part_mask is not None:
+            comps = _filter_page_components(part_mask, model, cfg)
+            groups = _score_candidate_groups(comps, detect_view, model, cfg)
+            summary_lines.append(f"group_route0_components={len(comps)}")
+            summary_lines.append(f"group_route0_candidates={len(groups)}")
+            for cand in groups:
+                group_rows.append(
+                    {
+                        "route": "group_0",
+                        "x": cand.x,
+                        "y": cand.y,
+                        "w": cand.w,
+                        "h": cand.h,
+                        "score": cand.score,
+                        "scale": cand.scale,
+                    }
+                )
+            group_candidates.extend(groups)
+
+        for route_idx, binary in enumerate(binaries, start=1):
+            comps = _filter_page_components(binary, model, cfg)
+            groups = _score_candidate_groups(comps, detect_view, model, cfg)
+            summary_lines.append(f"group_route{route_idx}_components={len(comps)}")
+            summary_lines.append(f"group_route{route_idx}_candidates={len(groups)}")
+            for cand in groups:
+                group_rows.append(
+                    {
+                        "route": f"group_{route_idx}",
+                        "x": cand.x,
+                        "y": cand.y,
+                        "w": cand.w,
+                        "h": cand.h,
+                        "score": cand.score,
+                        "scale": cand.scale,
+                    }
+                )
+            group_candidates.extend(groups)
+
+        match_candidates = _template_match_candidates(detect_view, model.mask, model, cfg, focus_mask=focus_mask)
+        edge_candidates = _edge_match_candidates(detect_view, model.mask, model, cfg, focus_mask=focus_mask)
+        _imwrite_unicode(debug_dir / f"{prefix}_group_candidates.png", _draw_group_candidates(detect_view, group_candidates, (0, 200, 255)))
+        _imwrite_unicode(debug_dir / f"{prefix}_template_match.png", _draw_group_candidates(detect_view, match_candidates, (255, 180, 0)))
+        _imwrite_unicode(debug_dir / f"{prefix}_edge_match.png", _draw_group_candidates(detect_view, edge_candidates, (180, 255, 0)))
+        if part_mask is not None:
+            part_preview = cv2.cvtColor(part_mask, cv2.COLOR_GRAY2BGR)
+            _imwrite_unicode(debug_dir / f"{prefix}_tiny_line_parts.png", part_preview)
+        if focus_mask is not None:
+            focus_preview = cv2.cvtColor(focus_mask, cv2.COLOR_GRAY2BGR)
+            _imwrite_unicode(debug_dir / f"{prefix}_tiny_line_focus.png", focus_preview)
+        _write_debug_table(
+            debug_dir / f"{prefix}_group_candidates.tsv",
+            ("route", "x", "y", "w", "h", "score", "scale"),
+            group_rows,
+        )
+        _write_debug_table(
+            debug_dir / f"{prefix}_template_match_trace.tsv",
+            ("route", "x", "y", "w", "h", "score", "scale"),
+            [
+                {
+                    "route": "template_match",
+                    "x": cand.x,
+                    "y": cand.y,
+                    "w": cand.w,
+                    "h": cand.h,
+                    "score": cand.score,
+                    "scale": cand.scale,
+                }
+                for cand in match_candidates
+            ],
+        )
+        _write_debug_table(
+            debug_dir / f"{prefix}_edge_match_trace.tsv",
+            ("route", "x", "y", "w", "h", "score", "scale"),
+            [
+                {
+                    "route": "edge_match",
+                    "x": cand.x,
+                    "y": cand.y,
+                    "w": cand.w,
+                    "h": cand.h,
+                    "score": cand.score,
+                    "scale": cand.scale,
+                }
+                for cand in edge_candidates
+            ],
+        )
+
+        accepted_sources: list[tuple[str, _GroupCandidate]] = []
+        accepted_sources.extend((row["route"], cand) for row, cand in zip(group_rows, group_candidates))
+        accepted_sources.extend(("template_match", cand) for cand in match_candidates)
+        accepted_sources.extend(("edge_match", cand) for cand in edge_candidates)
+        accepted_only = [cand for _, cand in accepted_sources]
+        kept_indices, suppressed = _nms_groups_trace(accepted_only, cfg.nms_iou_threshold)
+        accepted_rows: list[dict[str, object]] = []
+        for idx, (route_name, cand) in enumerate(accepted_sources, start=1):
+            accepted_rows.append(
+                {
+                    "proposal_index": idx,
+                    "route": route_name,
+                    "x": cand.x,
+                    "y": cand.y,
+                    "w": cand.w,
+                    "h": cand.h,
+                    "score": cand.score,
+                    "scale": cand.scale,
+                    "nms_status": "kept" if (idx - 1) in kept_indices else "suppressed",
+                    "nms_reason": suppressed.get(idx - 1, ""),
+                    "matches_final_output": _candidate_matches_final(cand, final_local),
+                }
+            )
+        _write_debug_table(
+            debug_dir / f"{prefix}_accepted_proposals.tsv",
+            ("proposal_index", "route", "x", "y", "w", "h", "score", "scale", "nms_status", "nms_reason", "matches_final_output"),
+            accepted_rows,
+        )
+
+        post_filter_rows: list[dict[str, object]] = []
+        post_filter_reason_counts: dict[str, int] = {}
+        for idx in sorted(kept_indices):
+            route_name, cand = accepted_sources[idx]
+            _, detail = _post_filter_candidate(cand, detect_view, model, cfg)
+            decision = str(detail.get("decision", "unknown"))
+            post_filter_reason_counts[decision] = post_filter_reason_counts.get(decision, 0) + 1
+            post_filter_rows.append(
+                {
+                    "proposal_index": idx + 1,
+                    "route": route_name,
+                    "x": cand.x,
+                    "y": cand.y,
+                    "w": cand.w,
+                    "h": cand.h,
+                    "base_score": cand.score,
+                    "scale": cand.scale,
+                    "box_scale": detail.get("box_scale", ""),
+                    "effective_min_scale": detail.get("effective_min_scale", ""),
+                    "effective_max_scale": detail.get("effective_max_scale", ""),
+                    "color_family_ok": detail.get("color_family_ok", ""),
+                    "center_ok": detail.get("center_ok", ""),
+                    "color_sim": detail.get("color_sim", ""),
+                    "min_color_similarity": detail.get("min_color_similarity", ""),
+                    "shape_sim": detail.get("shape_sim", ""),
+                    "edge_sim": detail.get("edge_sim", ""),
+                    "part_sim": detail.get("part_sim", ""),
+                    "gray_sim": detail.get("gray_sim", ""),
+                    "size_consistency": detail.get("size_consistency", ""),
+                    "acceptance_threshold": detail.get("acceptance_threshold", ""),
+                    "final_score": detail.get("final_score", ""),
+                    "decision": decision,
+                    "matches_final_output": _candidate_matches_final(cand, final_local),
+                }
+            )
+        _write_debug_table(
+            debug_dir / f"{prefix}_post_filter_trace.tsv",
+            (
+                "proposal_index", "route", "x", "y", "w", "h", "base_score", "scale", "box_scale",
+                "effective_min_scale", "effective_max_scale", "color_family_ok", "center_ok",
+                "color_sim", "min_color_similarity", "shape_sim", "edge_sim", "part_sim", "gray_sim", "size_consistency",
+                "acceptance_threshold", "final_score", "decision", "matches_final_output",
+            ),
+            post_filter_rows,
+        )
         summary_lines.extend(
             [
                 f"simple_blob_candidates={len(simple_blob)}",
                 f"dense_blob_candidates={len(dense_blob)}",
                 f"centered_blob_candidates={len(centered_blob)}",
+                f"group_candidates={len(group_candidates)}",
+                f"template_match_candidates={len(match_candidates)}",
+                f"edge_match_candidates={len(edge_candidates)}",
             ]
         )
+        if focus_mask is not None:
+            summary_lines.append(f"tiny_line_focus_pixels={int(np.count_nonzero(focus_mask))}")
+        summary_lines.append(f"pre_nms_accepted_total={len(accepted_only)}")
+        summary_lines.append(f"post_nms_kept_total={len(kept_indices)}")
+        for reason, count in sorted(post_filter_reason_counts.items()):
+            summary_lines.append(f"post_filter_{reason}={count}")
 
     _write_debug_table(
         debug_dir / f"{prefix}_final_candidates.tsv",

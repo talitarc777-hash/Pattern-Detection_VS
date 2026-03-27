@@ -24,6 +24,7 @@ from app.detector import (
     _imwrite_unicode,
     detect_document,
     detect_document_multi,
+    load_document_page,
     load_document_pages,
 )
 from app.review_ui import run_review
@@ -261,6 +262,15 @@ class PatternDetectionApp:
         }
         return mapping.get(self.color_mode_var.get(), "auto")
 
+    def _markup_pick_dpi(self) -> int:
+        try:
+            base_dpi = max(72, int(float(self.dpi_var.get().strip())))
+        except Exception:  # noqa: BLE001
+            base_dpi = 220
+        # Template picking needs a sharper page render than detection,
+        # especially for tiny markups on PDFs.
+        return int(min(900, max(450, base_dpi, int(round(base_dpi * 1.8)))))
+
     def _effective_scale_bounds(self, input_path: Path, min_scale: float, max_scale: float) -> tuple[float, float]:
         # If markup is cropped from the same file, symbols are usually close in size.
         # Tightening the scale sweep improves precision against text/lookalikes.
@@ -371,12 +381,9 @@ class PatternDetectionApp:
             if not input_path.exists():
                 raise ValueError("Choose an input file before picking markup.")
 
-            pages = load_document_pages(input_path, dpi=int(self.dpi_var.get()))
-            if not pages:
-                raise ValueError("Cannot load preview image for markup selection.")
-
-            image = pages[0]
-            preview, scale = _resize_preview(image, max_dim=1400)
+            pick_dpi = self._markup_pick_dpi()
+            image = load_document_page(input_path, dpi=pick_dpi, page_index=0)
+            preview, scale = _resize_preview(image, max_dim=2200)
             selection = _collect_markup_region(preview)
             if selection is None:
                 self._append_log("Markup selection cancelled.")
@@ -405,7 +412,7 @@ class PatternDetectionApp:
             self._refresh_markup_list()
             self._append_log(
                 f"Markup class added from page 1 -> {markup_path} "
-                f"(hint: {color_hint}, {shape_hint})"
+                f"(hint: {color_hint}, {shape_hint}, pick DPI: {pick_dpi}, crop: {crop.shape[1]}x{crop.shape[0]})"
             )
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"ERROR picking markup: {exc}")
@@ -742,7 +749,7 @@ def _collect_markup_region(image):
     freehand = {"drawing": False, "points": []}
     mode = {"value": "rect"}
     zoom = {"value": 1.0}
-    max_zoom = 6.0
+    max_zoom = 16.0
     min_zoom = 0.5
     view = {"x0": 0, "y0": 0, "w": base.shape[1], "h": base.shape[0]}
     center = {"x": base.shape[1] / 2.0, "y": base.shape[0] / 2.0}
@@ -817,7 +824,8 @@ def _collect_markup_region(image):
         vw = view["w"]
         vh = view["h"]
         cropped = base[y0 : y0 + vh, x0 : x0 + vw]
-        canvas = cv2.resize(cropped, (bw, bh), interpolation=cv2.INTER_LINEAR)
+        interp = cv2.INTER_NEAREST if zoom["value"] >= 2.0 else cv2.INTER_LINEAR
+        canvas = cv2.resize(cropped, (bw, bh), interpolation=interp)
         start = selection["start"]
         end = selection["end"]
         rect = selection["rect"]
@@ -842,7 +850,7 @@ def _collect_markup_region(image):
 
         cv2.putText(
             canvas,
-            "Mode: R=box, F=freehand | Middle-drag=pan | +/- or wheel=zoom | Enter=finish | C=clear | Esc=cancel",
+            "Mode: R=box, F=freehand | Middle-drag=pan | +/- or wheel=zoom | 0=reset | Enter=finish | C=clear | Esc=cancel",
             (12, 28),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.52,
