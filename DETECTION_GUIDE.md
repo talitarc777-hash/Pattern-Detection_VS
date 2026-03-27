@@ -88,10 +88,12 @@ For grouped component candidates, the score is mainly based on:
 
 For simple blob candidates, the score is mainly based on:
 
+- the dominant inner blob inside the candidate patch
 - circularity
 - aspect ratio
 - solidity
 - color similarity
+- size consistency around the template mark
 
 ### 4.2 Color check
 
@@ -123,6 +125,18 @@ In simple terms:
 Many search paths may find the same markup.
 
 The detector then runs NMS, which removes overlapping duplicate boxes and keeps the stronger one.
+
+For simple filled marks, there is also a final blob-specific post-filter after NMS.
+
+That post-filter re-checks:
+
+- the refined inner blob, not just the raw connected component box
+- markup-only color similarity
+- blob-centeredness
+- shape similarity
+- effective size window
+
+This extra step helps reject tiny text specks that have the right color but are still the wrong object.
 
 ### 4.5 Scope filter
 
@@ -253,6 +267,8 @@ Good rule:
 
 This is the smallest allowed size of a candidate relative to the template.
 
+For simple filled marks, this now behaves more like a blob box-size check than a raw filled-area check.
+
 - lower value
   - allows smaller candidates
   - helps when marks on the page are much smaller than the template
@@ -265,12 +281,20 @@ This is the smallest allowed size of a candidate relative to the template.
 
 This is the largest allowed size of a candidate relative to the template.
 
+For simple filled marks, this also behaves more like a blob box-size check than a raw filled-area check.
+
 - higher value
   - allows larger candidates
   - helps when marks on the page are much bigger than the template
   - increases false positives
 - lower value
   - rejects oversized lookalikes
+
+For tiny filled marks, the detector also applies a small internal upper-size buffer.
+
+This is intentional, because rasterization and thresholding can make a real page dot measure slightly larger than the cropped template even when it is truly the same markup.
+
+If the markup was cropped from the same file, the detector also uses a tighter lower-size bound to reject tiny specks.
 
 ### Dark threshold
 
