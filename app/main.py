@@ -13,6 +13,7 @@ ctk.set_default_color_theme("blue")
 
 import cv2
 import numpy as np
+from PIL import Image, ImageTk
 
 from app.detector import (
     Candidate,
@@ -27,14 +28,13 @@ from app.detector import (
     load_document_page,
     load_document_pages,
 )
-from app.review_ui import run_review
 
 
 class PatternDetectionApp:
     def __init__(self, root: ctk.CTk) -> None:
         self.root = root
         self.root.title("Pattern Markup Counter")
-        self.root.geometry("860x620")
+        self.root.geometry("1480x900")
 
         self.input_var = tk.StringVar()
         self.template_var = tk.StringVar()
@@ -57,31 +57,64 @@ class PatternDetectionApp:
         self.last_summary: DetectionSummary | None = None
         self.last_pages: list[np.ndarray] = []
         self.last_scope = None
+        self.viewer_page_index = 0
+        self.viewer_pages: list[np.ndarray] = []
+        self.viewer_mode_var = tk.StringVar(value="View")
+        self.viewer_scale = 1.0
+        self.viewer_offset_x = 0.0
+        self.viewer_offset_y = 0.0
+        self.viewer_pan_anchor: tuple[int, int] | None = None
+        self.viewer_draw_start: tuple[int, int] | None = None
+        self.viewer_pending_rect: tuple[int, int, int, int] | None = None
+        self.viewer_photo: ImageTk.PhotoImage | None = None
+        self.inline_page_candidates: list[list[Candidate]] = []
+        self.scope_draw_points: list[tuple[int, int]] = []
+        self.scope_drawing_active = False
 
         self._build_ui()
 
     def _build_ui(self) -> None:
-        main = ctk.CTkScrollableFrame(self.root, fg_color="transparent")
-        main.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        container = ctk.CTkFrame(self.root, fg_color="transparent")
+        container.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
 
+        split = tk.PanedWindow(container, orient=tk.HORIZONTAL, sashrelief=tk.RAISED, sashwidth=8, bd=0)
+        split.pack(fill=tk.BOTH, expand=True)
+
+        left_host = tk.Frame(split, bg="#1f1f1f")
+        right_host = tk.Frame(split, bg="#1f1f1f")
+        split.add(left_host, minsize=320, stretch="never")
+        split.add(right_host, minsize=580, stretch="always")
+
+        left = ctk.CTkScrollableFrame(left_host, fg_color="transparent", width=380)
+        left.pack(fill=tk.BOTH, expand=True, padx=(0, 10))
+        right = ctk.CTkFrame(right_host)
+        right.pack(fill=tk.BOTH, expand=True)
+        right.grid_rowconfigure(2, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(left, text="Step 1: Load Drawing", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(0, 6))
         self._add_picker_row(
-            main,
-            "1. Input file (.png/.jpg/.jpeg/.pdf)",
+            left,
+            "Drawing file (.png/.jpg/.jpeg/.pdf)",
             self.input_var,
             self._browse_input,
+            button_text="Browse...",
         )
-        self._add_markup_row(main)
+        ctk.CTkLabel(left, text="Step 2: Set Markup Templates", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(10, 4))
+        self._add_markup_row(left)
+        ctk.CTkLabel(left, text="Step 3: Choose Output", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(10, 4))
         self._add_picker_row(
-            main,
-            "4. Output folder",
+            left,
+            "Output folder",
             self.output_var,
             self._browse_output,
             button_text="Browse...",
         )
-        self._add_scope_row(main)
+        ctk.CTkLabel(left, text="Step 4: Draw Detection Scope (Optional)", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(10, 4))
+        self._add_scope_row(left)
 
-        ctk.CTkLabel(main, text="Detection settings", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(20, 4))
-        simple = ctk.CTkFrame(main)
+        ctk.CTkLabel(left, text="Step 5: Detection Settings", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(16, 4))
+        simple = ctk.CTkFrame(left)
         simple.pack(fill="x", pady=4)
         self._add_dropdown_setting(
             simple,
@@ -113,7 +146,7 @@ class PatternDetectionApp:
             text_color=("gray35", "gray75"),
         ).grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(2, 8))
 
-        toggle = ctk.CTkFrame(main, fg_color="transparent")
+        toggle = ctk.CTkFrame(left, fg_color="transparent")
         toggle.pack(fill="x", pady=(2, 2))
         ctk.CTkCheckBox(
             toggle,
@@ -122,7 +155,7 @@ class PatternDetectionApp:
             command=self._toggle_advanced_settings,
         ).pack(anchor="w")
 
-        self.advanced_settings = ctk.CTkFrame(main)
+        self.advanced_settings = ctk.CTkFrame(left)
         self._add_setting(self.advanced_settings, "Match threshold (0.45-0.9):", self.threshold_var, row=0, col=0)
         self._add_setting(self.advanced_settings, "PDF render DPI:", self.dpi_var, row=0, col=1)
         self._add_setting(self.advanced_settings, "Min scale:", self.min_scale_var, row=1, col=0)
@@ -131,17 +164,56 @@ class PatternDetectionApp:
         self._add_setting(self.advanced_settings, "NMS IoU threshold:", self.nms_var, row=2, col=1)
         self._add_setting(self.advanced_settings, "Num scale steps:", self.num_scales_var, row=3, col=0)
 
-        action = ctk.CTkFrame(main, fg_color="transparent")
-        action.pack(fill="x", pady=20)
+        action = ctk.CTkFrame(left, fg_color="transparent")
+        action.pack(fill="x", pady=16)
         ctk.CTkButton(action, text="Run Detection", command=self._run_detection, height=40, font=ctk.CTkFont(weight="bold")).pack(side=tk.LEFT)
         ctk.CTkButton(action, text="Review Results", command=self._review_results, height=40, fg_color="#2B8C67", hover_color="#1E654A", font=ctk.CTkFont(weight="bold")).pack(side=tk.LEFT, padx=(12, 0))
+        ctk.CTkButton(action, text="Save Edits", command=self._save_inline_review, height=40, fg_color="#2B8C67", hover_color="#1E654A", font=ctk.CTkFont(weight="bold")).pack(side=tk.LEFT, padx=(12, 0))
         ctk.CTkButton(action, text="Clear Log", command=self._clear_log, fg_color="transparent", border_width=1, text_color=("black", "white")).pack(side=tk.RIGHT)
 
-        ctk.CTkLabel(main, text="Run log", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(0, 4))
-        self.log = ctk.CTkTextbox(main, height=200)
+        ctk.CTkLabel(left, text="Run log", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(0, 4))
+        self.log = ctk.CTkTextbox(left, height=220)
         self.log.pack(fill=tk.BOTH, expand=True)
-        self._append_log("Ready. Choose the input file, pick one markup from that file, draw scope if needed, then run detection.")
-        self._append_log("You can add multiple markups (classes) from the same file before running.")
+
+        ctk.CTkLabel(right, text="Main workspace", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+        view_toolbar = ctk.CTkFrame(right)
+        view_toolbar.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        ctk.CTkButton(view_toolbar, text="Prev Page", command=self._viewer_prev_page, width=86).pack(side=tk.LEFT, padx=(8, 4), pady=6)
+        ctk.CTkButton(view_toolbar, text="Next Page", command=self._viewer_next_page, width=86).pack(side=tk.LEFT, padx=4, pady=6)
+        ctk.CTkLabel(view_toolbar, text="Tool:").pack(side=tk.LEFT, padx=(14, 6))
+        self.viewer_mode_menu = ctk.CTkOptionMenu(
+            view_toolbar,
+            variable=self.viewer_mode_var,
+            values=["View", "Select Markup", "Draw Scope"],
+            width=170,
+        )
+        self.viewer_mode_menu.pack(side=tk.LEFT, padx=(0, 8))
+        ctk.CTkLabel(view_toolbar, text="Detection Edit:").pack(side=tk.LEFT, padx=(12, 6))
+        self.add_detection_btn = ctk.CTkButton(view_toolbar, text="Add", width=64, command=self._set_add_detection_mode, state="disabled")
+        self.add_detection_btn.pack(side=tk.LEFT, padx=(0, 4), pady=6)
+        self.del_detection_btn = ctk.CTkButton(view_toolbar, text="Delete", width=70, command=self._set_delete_detection_mode, state="disabled")
+        self.del_detection_btn.pack(side=tk.LEFT, padx=(0, 8), pady=6)
+        self.viewer_info = ctk.CTkLabel(view_toolbar, text="Page 0/0")
+        self.viewer_info.pack(side=tk.LEFT, padx=8)
+
+        canvas_holder = ctk.CTkFrame(right)
+        canvas_holder.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.viewer_canvas = tk.Canvas(canvas_holder, bg="#1f1f1f", highlightthickness=0)
+        self.viewer_canvas.pack(fill=tk.BOTH, expand=True)
+        self.viewer_canvas.bind("<Configure>", self._on_viewer_resize)
+        self.viewer_canvas.bind("<ButtonPress-1>", self._on_viewer_mouse_down)
+        self.viewer_canvas.bind("<B1-Motion>", self._on_viewer_mouse_drag)
+        self.viewer_canvas.bind("<ButtonRelease-1>", self._on_viewer_mouse_up)
+        self.viewer_canvas.bind("<MouseWheel>", self._on_viewer_mousewheel)
+        self.viewer_canvas.bind("<ButtonPress-2>", self._on_viewer_pan_start)
+        self.viewer_canvas.bind("<B2-Motion>", self._on_viewer_pan_move)
+        self.viewer_canvas.bind("<ButtonPress-3>", self._on_viewer_right_down)
+        self.viewer_canvas.bind("<B3-Motion>", self._on_viewer_right_drag)
+        self.viewer_canvas.bind("<Double-Button-1>", self._on_viewer_double_click)
+
+        self._append_log("Ready. Start from Step 1 on the left, then work in the main workspace on the right.")
+        self._append_log("Tip: Use 'Select Markup' tool and drag a box on the image to add markup templates.")
+        self._set_viewer_mode_values(detection_ready=False)
 
     def _add_picker_row(
         self,
@@ -184,7 +256,7 @@ class PatternDetectionApp:
     def _add_markup_row(self, parent: ctk.CTkFrame) -> None:
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", pady=4)
-        ctk.CTkLabel(row, text="2. Markup classes from this file", width=220, anchor="w").pack(side=tk.LEFT)
+        ctk.CTkLabel(row, text="Markup templates", width=220, anchor="w").pack(side=tk.LEFT)
         list_wrap = ctk.CTkFrame(row)
         list_wrap.pack(side=tk.LEFT, fill="x", expand=True, padx=12)
         self.markup_listbox = tk.Listbox(list_wrap, height=4, exportselection=False)
@@ -193,6 +265,7 @@ class PatternDetectionApp:
         btns = ctk.CTkFrame(row, fg_color="transparent")
         btns.pack(side=tk.RIGHT)
         ctk.CTkButton(btns, text="Add Markup", command=self._pick_markup, width=110).pack(anchor="e", pady=(0, 4))
+        ctk.CTkButton(btns, text="Import Template", command=self._import_markup_template, width=110).pack(anchor="e", pady=(0, 4))
         ctk.CTkButton(btns, text="Rename", command=self._rename_markup, width=110).pack(anchor="e", pady=(0, 4))
         ctk.CTkButton(btns, text="Remove", command=self._remove_markup, width=110).pack(anchor="e", pady=(0, 4))
         ctk.CTkButton(
@@ -302,6 +375,299 @@ class PatternDetectionApp:
         entry.bind("<KeyPress-KP_Decimal>", insert_dot)
         entry.bind("<KeyPress-comma>", insert_dot)
 
+    def _viewer_current_page(self) -> np.ndarray | None:
+        if not self.viewer_pages:
+            return None
+        idx = int(np.clip(self.viewer_page_index, 0, len(self.viewer_pages) - 1))
+        return self.viewer_pages[idx]
+
+    def _set_viewer_mode_values(self, detection_ready: bool) -> None:
+        values = ["View", "Select Markup", "Draw Scope"]
+        self.viewer_mode_menu.configure(values=values)
+        if hasattr(self, "add_detection_btn") and hasattr(self, "del_detection_btn"):
+            state = "normal" if detection_ready else "disabled"
+            self.add_detection_btn.configure(state=state)
+            self.del_detection_btn.configure(state=state)
+        if self.viewer_mode_var.get() not in values:
+            self.viewer_mode_var.set("View")
+        if not detection_ready and self.viewer_mode_var.get() in {"Add Detection", "Delete Detection"}:
+            self.viewer_mode_var.set("View")
+
+    def _set_add_detection_mode(self) -> None:
+        if not self.inline_page_candidates:
+            return
+        self.viewer_mode_var.set("Add Detection")
+        self._append_log("Detection edit mode: Add. Drag a box on the main image view.")
+
+    def _set_delete_detection_mode(self) -> None:
+        if not self.inline_page_candidates:
+            return
+        self.viewer_mode_var.set("Delete Detection")
+        self._append_log("Detection edit mode: Delete. Click a box to remove it.")
+
+    def _viewer_set_info(self) -> None:
+        if not self.viewer_pages:
+            self.viewer_info.configure(text="Page 0/0")
+            return
+        count = 0
+        if self.inline_page_candidates and self.viewer_page_index < len(self.inline_page_candidates):
+            count = len(self.inline_page_candidates[self.viewer_page_index])
+        self.viewer_info.configure(
+            text=f"Page {self.viewer_page_index + 1}/{len(self.viewer_pages)} | Detections: {count}"
+        )
+
+    def _viewer_fit(self) -> None:
+        page = self._viewer_current_page()
+        if page is None:
+            return
+        canvas_w = max(1, self.viewer_canvas.winfo_width())
+        canvas_h = max(1, self.viewer_canvas.winfo_height())
+        img_h, img_w = page.shape[:2]
+        self.viewer_scale = min(canvas_w / float(img_w), canvas_h / float(img_h), 1.0)
+        self.viewer_offset_x = (canvas_w - img_w * self.viewer_scale) / 2.0
+        self.viewer_offset_y = (canvas_h - img_h * self.viewer_scale) / 2.0
+
+    def _viewer_canvas_to_image(self, cx: int, cy: int) -> tuple[int, int]:
+        page = self._viewer_current_page()
+        if page is None:
+            return 0, 0
+        img_h, img_w = page.shape[:2]
+        ix = int(round((cx - self.viewer_offset_x) / max(self.viewer_scale, 1e-6)))
+        iy = int(round((cy - self.viewer_offset_y) / max(self.viewer_scale, 1e-6)))
+        ix = int(np.clip(ix, 0, img_w - 1))
+        iy = int(np.clip(iy, 0, img_h - 1))
+        return ix, iy
+
+    def _viewer_image_to_canvas(self, ix: int, iy: int) -> tuple[float, float]:
+        return (
+            ix * self.viewer_scale + self.viewer_offset_x,
+            iy * self.viewer_scale + self.viewer_offset_y,
+        )
+
+    def _viewer_overlay_candidates(self, canvas_rgb: np.ndarray, candidates: list[Candidate]) -> None:
+        ordered = sorted(candidates, key=lambda cand: (cand.y, cand.x))
+        for idx, cand in enumerate(ordered, start=1):
+            cv2.rectangle(
+                canvas_rgb,
+                (cand.x, cand.y),
+                (cand.x + cand.w, cand.y + cand.h),
+                (0, 255, 0),
+                2,
+            )
+            cv2.putText(
+                canvas_rgb,
+                str(idx),
+                (cand.x + 2, max(14, cand.y - 4)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+    def _redraw_viewer(self) -> None:
+        page = self._viewer_current_page()
+        if page is None:
+            self.viewer_canvas.delete("all")
+            self._viewer_set_info()
+            return
+
+        canvas_rgb = cv2.cvtColor(page, cv2.COLOR_BGR2RGB)
+        try:
+            active_scope = self.last_scope or _parse_scope(self.scope_var.get())
+        except Exception:  # noqa: BLE001
+            active_scope = self.last_scope
+        if active_scope:
+            h, w = page.shape[:2]
+            scope_pts = np.asarray([(int(x * w), int(y * h)) for x, y in active_scope], dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(canvas_rgb, [scope_pts], isClosed=True, color=(0, 180, 0), thickness=2)
+        if self.scope_draw_points:
+            draw_pts = np.asarray(self.scope_draw_points, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(canvas_rgb, [draw_pts], isClosed=False, color=(255, 165, 0), thickness=2)
+            for pt in self.scope_draw_points:
+                cv2.circle(canvas_rgb, pt, 3, (255, 165, 0), -1)
+
+        if self.inline_page_candidates and self.viewer_page_index < len(self.inline_page_candidates):
+            self._viewer_overlay_candidates(canvas_rgb, self.inline_page_candidates[self.viewer_page_index])
+
+        if self.viewer_pending_rect is not None:
+            x0, y0, x1, y1 = self.viewer_pending_rect
+            cv2.rectangle(canvas_rgb, (x0, y0), (x1, y1), (255, 165, 0), 2)
+
+        img_h, img_w = canvas_rgb.shape[:2]
+        draw_w = max(1, int(round(img_w * self.viewer_scale)))
+        draw_h = max(1, int(round(img_h * self.viewer_scale)))
+        resized = cv2.resize(canvas_rgb, (draw_w, draw_h), interpolation=cv2.INTER_LINEAR)
+        self.viewer_photo = ImageTk.PhotoImage(Image.fromarray(resized))
+        self.viewer_canvas.delete("all")
+        self.viewer_canvas.create_image(self.viewer_offset_x, self.viewer_offset_y, image=self.viewer_photo, anchor="nw")
+        self._viewer_set_info()
+
+    def _viewer_prev_page(self) -> None:
+        if self.viewer_page_index > 0:
+            self.viewer_page_index -= 1
+            self._viewer_fit()
+            self._redraw_viewer()
+
+    def _viewer_next_page(self) -> None:
+        if self.viewer_page_index < len(self.viewer_pages) - 1:
+            self.viewer_page_index += 1
+            self._viewer_fit()
+            self._redraw_viewer()
+
+    def _on_viewer_resize(self, _event) -> None:
+        if self.viewer_pages:
+            self._viewer_fit()
+            self._redraw_viewer()
+
+    def _on_viewer_pan_start(self, event) -> None:
+        self.viewer_pan_anchor = (event.x, event.y)
+
+    def _on_viewer_pan_move(self, event) -> None:
+        if self.viewer_mode_var.get() == "Draw Scope":
+            return
+        if self.viewer_pan_anchor is None:
+            return
+        dx = event.x - self.viewer_pan_anchor[0]
+        dy = event.y - self.viewer_pan_anchor[1]
+        self.viewer_pan_anchor = (event.x, event.y)
+        self.viewer_offset_x += dx
+        self.viewer_offset_y += dy
+        self._redraw_viewer()
+
+    def _on_viewer_mousewheel(self, event) -> None:
+        if not self.viewer_pages:
+            return
+        anchor_x, anchor_y = self._viewer_canvas_to_image(event.x, event.y)
+        zoom = 1.15 if event.delta > 0 else (1.0 / 1.15)
+        self.viewer_scale = float(np.clip(self.viewer_scale * zoom, 0.05, 10.0))
+        self.viewer_offset_x = event.x - anchor_x * self.viewer_scale
+        self.viewer_offset_y = event.y - anchor_y * self.viewer_scale
+        self._redraw_viewer()
+
+    def _on_viewer_mouse_down(self, event) -> None:
+        if not self.viewer_pages:
+            return
+        mode = self.viewer_mode_var.get()
+        ix, iy = self._viewer_canvas_to_image(event.x, event.y)
+        if mode == "Draw Scope":
+            self.scope_drawing_active = True
+            if not self.scope_draw_points or self.scope_draw_points[-1] != (ix, iy):
+                self.scope_draw_points.append((ix, iy))
+            self._redraw_viewer()
+            return
+        if mode in {"Select Markup", "Add Detection"}:
+            self.viewer_draw_start = (ix, iy)
+            self.viewer_pending_rect = (ix, iy, ix, iy)
+            self._redraw_viewer()
+            return
+        if mode == "Delete Detection" and self.inline_page_candidates and self.viewer_page_index < len(self.inline_page_candidates):
+            candidates = self.inline_page_candidates[self.viewer_page_index]
+            for idx in range(len(candidates) - 1, -1, -1):
+                cand = candidates[idx]
+                if cand.x <= ix <= cand.x + cand.w and cand.y <= iy <= cand.y + cand.h:
+                    del candidates[idx]
+                    self._redraw_viewer()
+                    return
+
+    def _on_viewer_mouse_drag(self, event) -> None:
+        if self.viewer_mode_var.get() == "Draw Scope":
+            if not self.scope_drawing_active:
+                return
+            ix, iy = self._viewer_canvas_to_image(event.x, event.y)
+            if not self.scope_draw_points:
+                self.scope_draw_points.append((ix, iy))
+            else:
+                lx, ly = self.scope_draw_points[-1]
+                if abs(ix - lx) + abs(iy - ly) >= 3:
+                    self.scope_draw_points.append((ix, iy))
+            self._redraw_viewer()
+            return
+        if self.viewer_draw_start is None:
+            return
+        ix, iy = self._viewer_canvas_to_image(event.x, event.y)
+        x0, y0 = self.viewer_draw_start
+        self.viewer_pending_rect = (min(x0, ix), min(y0, iy), max(x0, ix), max(y0, iy))
+        self._redraw_viewer()
+
+    def _on_viewer_mouse_up(self, _event) -> None:
+        if self.viewer_mode_var.get() == "Draw Scope":
+            self.scope_drawing_active = False
+            return
+        if self.viewer_draw_start is None or self.viewer_pending_rect is None:
+            return
+        mode = self.viewer_mode_var.get()
+        x0, y0, x1, y1 = self.viewer_pending_rect
+        self.viewer_draw_start = None
+        self.viewer_pending_rect = None
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            self._redraw_viewer()
+            return
+        if mode == "Select Markup":
+            self._add_markup_from_rect(x0, y0, x1, y1)
+        elif mode == "Add Detection" and self.inline_page_candidates and self.viewer_page_index < len(self.inline_page_candidates):
+            self.inline_page_candidates[self.viewer_page_index].append(
+                Candidate(
+                    x=x0,
+                    y=y0,
+                    w=x1 - x0,
+                    h=y1 - y0,
+                    score=1.0,
+                    angle=0.0,
+                    scale=1.0,
+                )
+            )
+        self._redraw_viewer()
+
+    def _on_viewer_double_click(self, _event) -> None:
+        if self.viewer_mode_var.get() == "Draw Scope":
+            self._finish_scope_from_viewer()
+
+    def _on_viewer_right_down(self, event) -> None:
+        if self.viewer_mode_var.get() == "Draw Scope":
+            if self.scope_draw_points:
+                self.scope_draw_points.pop()
+                self._append_log("Scope point removed.")
+                self._redraw_viewer()
+            return
+        self._on_viewer_pan_start(event)
+
+    def _on_viewer_right_drag(self, event) -> None:
+        if self.viewer_mode_var.get() != "Draw Scope":
+            self._on_viewer_pan_move(event)
+
+    def _add_markup_from_rect(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        try:
+            page = self._viewer_current_page()
+            input_path = Path(self.input_var.get().strip())
+            if page is None or not input_path.exists():
+                raise ValueError("Choose input first.")
+            crop = page[y0:y1, x0:x1].copy()
+            if crop.shape[0] < 4 or crop.shape[1] < 4:
+                raise ValueError("Markup crop is too small.")
+            color_hint, shape_hint = _infer_markup_hint(crop)
+            cache_dir = (Path.cwd() / ".pattern_detection_cache").resolve()
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            markup_path = cache_dir / f"selected_markup_{len(self.markup_items)+1:02d}.png"
+            _imwrite_unicode(markup_path, crop)
+            self.markup_source_path = input_path.resolve()
+            self.markup_items.append(
+                {
+                    "name": f"Markup {len(self.markup_items)+1}",
+                    "path": str(markup_path),
+                    "source": str(self.markup_source_path),
+                    "color_hint": color_hint,
+                    "shape_hint": shape_hint,
+                }
+            )
+            self.template_var.set(str(markup_path))
+            self._refresh_markup_list()
+            self._append_log(
+                f"Markup class added from main image view -> {markup_path} (hint: {color_hint}, {shape_hint}, crop: {crop.shape[1]}x{crop.shape[0]})"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"ERROR adding markup from image view: {exc}")
+
     def _browse_input(self) -> None:
         file_path = filedialog.askopenfilename(
             title="Choose input file",
@@ -317,6 +683,19 @@ class PatternDetectionApp:
                 self._clear_markup()
                 self.scope_var.set("")
                 self._append_log("Input file changed. Markup selection and scope were cleared.")
+            try:
+                preview_dpi = int(float(self.dpi_var.get().strip()))
+            except Exception:  # noqa: BLE001
+                preview_dpi = 220
+            self.viewer_pages = load_document_pages(Path(file_path), dpi=max(120, preview_dpi))
+            self.viewer_page_index = 0
+            self.inline_page_candidates = []
+            self.scope_draw_points = []
+            self.scope_drawing_active = False
+            self._set_viewer_mode_values(detection_ready=False)
+            if self.viewer_pages:
+                self._viewer_fit()
+                self._redraw_viewer()
 
     def _browse_output(self) -> None:
         folder = filedialog.askdirectory(title="Choose output folder")
@@ -328,6 +707,7 @@ class PatternDetectionApp:
         self.markup_source_path = None
         self.markup_items = []
         self._refresh_markup_list()
+        self._set_viewer_mode_values(detection_ready=bool(self.last_summary and self.inline_page_candidates))
 
     def _refresh_markup_list(self) -> None:
         if not hasattr(self, "markup_listbox"):
@@ -370,81 +750,103 @@ class PatternDetectionApp:
     def _add_scope_row(self, parent: ctk.CTkFrame) -> None:
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", pady=4)
-        ctk.CTkLabel(row, text="3. Detection scope (optional)", width=220, anchor="w").pack(side=tk.LEFT)
+        ctk.CTkLabel(row, text="Detection scope (optional)", width=220, anchor="w").pack(side=tk.LEFT)
         ctk.CTkEntry(row, textvariable=self.scope_var).pack(side=tk.LEFT, fill="x", expand=True, padx=12)
         ctk.CTkButton(row, text="Draw Scope", command=self._pick_scope, width=100).pack(side=tk.RIGHT)
-        ctk.CTkButton(row, text="Clear", command=lambda: self.scope_var.set(""), fg_color="transparent", border_width=1, text_color=("black", "white"), width=60).pack(side=tk.RIGHT, padx=(0, 12))
+        ctk.CTkButton(row, text="Finish", command=self._finish_scope_from_viewer, width=78).pack(side=tk.RIGHT, padx=(8, 0))
+        ctk.CTkButton(row, text="Clear", command=self._clear_scope, fg_color="transparent", border_width=1, text_color=("black", "white"), width=60).pack(side=tk.RIGHT, padx=(8, 12))
 
     def _pick_markup(self) -> None:
         try:
             input_path = Path(self.input_var.get().strip())
             if not input_path.exists():
                 raise ValueError("Choose an input file before picking markup.")
-
-            pick_dpi = self._markup_pick_dpi()
-            image = load_document_page(input_path, dpi=pick_dpi, page_index=0)
-            preview, scale = _resize_preview(image, max_dim=2200)
-            selection = _collect_markup_region(preview)
-            if selection is None:
-                self._append_log("Markup selection cancelled.")
-                return
-
-            crop = _extract_markup_crop_from_selection(image, selection, scale)
-            if crop.shape[0] < 4 or crop.shape[1] < 4:
-                raise ValueError("Markup crop is too small. Please select a slightly larger region.")
-            color_hint, shape_hint = _infer_markup_hint(crop)
-            cache_dir = (Path.cwd() / ".pattern_detection_cache").resolve()
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            markup_path = cache_dir / f"selected_markup_{len(self.markup_items)+1:02d}.png"
-            _imwrite_unicode(markup_path, crop)
-
-            self.markup_source_path = input_path.resolve()
-            self.markup_items.append(
-                {
-                    "name": f"Markup {len(self.markup_items)+1}",
-                    "path": str(markup_path),
-                    "source": str(self.markup_source_path),
-                    "color_hint": color_hint,
-                    "shape_hint": shape_hint,
-                }
-            )
-            self.template_var.set(str(markup_path))
-            self._refresh_markup_list()
-            self._append_log(
-                f"Markup class added from page 1 -> {markup_path} "
-                f"(hint: {color_hint}, {shape_hint}, pick DPI: {pick_dpi}, crop: {crop.shape[1]}x{crop.shape[0]})"
-            )
+            if not self.viewer_pages:
+                pick_dpi = self._markup_pick_dpi()
+                self.viewer_pages = load_document_pages(input_path, dpi=pick_dpi)
+                self.viewer_page_index = 0
+                self._viewer_fit()
+                self._redraw_viewer()
+            self.viewer_mode_var.set("Select Markup")
+            self._append_log("Select Markup mode enabled. Drag a box on the main image view to add a markup class.")
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"ERROR picking markup: {exc}")
             messagebox.showerror(title="Markup Selection Failed", message=str(exc))
+
+    def _import_markup_template(self) -> None:
+        try:
+            paths = filedialog.askopenfilenames(
+                title="Import markup template image(s)",
+                filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"), ("All files", "*.*")],
+            )
+            if not paths:
+                return
+            for raw in paths:
+                template_path = Path(raw).resolve()
+                if not template_path.exists():
+                    continue
+                crop = _imread_unicode(template_path)
+                color_hint, shape_hint = _infer_markup_hint(crop)
+                self.markup_items.append(
+                    {
+                        "name": template_path.stem or f"Markup {len(self.markup_items)+1}",
+                        "path": str(template_path),
+                        "source": "external",
+                        "color_hint": color_hint,
+                        "shape_hint": shape_hint,
+                    }
+                )
+                self.template_var.set(str(template_path))
+            self._refresh_markup_list()
+            self._append_log(f"Imported {len(paths)} markup template(s) from file explorer.")
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"ERROR importing markup templates: {exc}")
+            messagebox.showerror(title="Template Import Failed", message=str(exc))
 
     def _pick_scope(self) -> None:
         try:
             input_path = Path(self.input_var.get().strip())
             if not input_path.exists():
                 raise ValueError("Choose an input file before picking scope.")
-
-            pages = load_document_pages(input_path, dpi=int(self.dpi_var.get()))
-            if not pages:
-                raise ValueError("Cannot load preview image for scope selection.")
-
-            image = pages[0]
-            preview, scale = _resize_preview(image, max_dim=1400)
-            polygon = _collect_freehand_polygon(preview)
-            if not polygon:
-                self._append_log("Scope selection cancelled.")
-                return
-
-            orig_h, orig_w = image.shape[:2]
-            normalized = []
-            for x, y in polygon:
-                normalized.append(((x / scale) / orig_w, (y / scale) / orig_h))
-            scope_text = "poly:" + ";".join(f"{x:.6f},{y:.6f}" for x, y in normalized)
-            self.scope_var.set(scope_text)
-            self._append_log(f"Scope set: {scope_text}")
+            if not self.viewer_pages:
+                self.viewer_pages = load_document_pages(input_path, dpi=max(120, int(float(self.dpi_var.get().strip()))))
+                self.viewer_page_index = 0
+                self._viewer_fit()
+            self.scope_draw_points = []
+            self.scope_drawing_active = False
+            self.viewer_mode_var.set("Draw Scope")
+            self._append_log("Draw Scope mode enabled. Drag to trace, click Finish (or double-click) to close, right-click to undo a point.")
+            self._redraw_viewer()
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"ERROR picking scope: {exc}")
             messagebox.showerror(title="Scope Selection Failed", message=str(exc))
+
+    def _finish_scope_from_viewer(self) -> None:
+        try:
+            page = self._viewer_current_page()
+            if page is None:
+                raise ValueError("Load an input image first.")
+            if len(self.scope_draw_points) < 3:
+                raise ValueError("Scope needs at least 3 points.")
+            h, w = page.shape[:2]
+            normalized = tuple((x / float(w), y / float(h)) for x, y in self.scope_draw_points)
+            scope_text = "poly:" + ";".join(f"{x:.6f},{y:.6f}" for x, y in normalized)
+            self.scope_var.set(scope_text)
+            self.last_scope = normalized
+            self.scope_draw_points = []
+            self.scope_drawing_active = False
+            self.viewer_mode_var.set("View")
+            self._append_log(f"Scope set from main image view: {scope_text}")
+            self._redraw_viewer()
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"ERROR finishing scope: {exc}")
+
+    def _clear_scope(self) -> None:
+        self.scope_var.set("")
+        self.last_scope = None
+        self.scope_draw_points = []
+        self.scope_drawing_active = False
+        self._redraw_viewer()
 
     def _run_detection(self) -> None:
         try:
@@ -459,8 +861,6 @@ class PatternDetectionApp:
                     self.markup_items = [{"name": legacy_path.stem or "Markup 1", "path": str(legacy_path), "source": str(input_path.resolve())}]
                 else:
                     raise ValueError("Pick at least one markup from the input file before running detection.")
-            if self.markup_source_path is None or self.markup_source_path != input_path.resolve():
-                raise ValueError("Pick markups again after changing the input file.")
             output_dir.mkdir(parents=True, exist_ok=True)
 
             if not self.show_advanced_var.get():
@@ -469,7 +869,8 @@ class PatternDetectionApp:
             user_min_scale = float(self.min_scale_var.get())
             user_max_scale = float(self.max_scale_var.get())
             resolved_input = input_path.resolve()
-            min_scale, max_scale = self._effective_scale_bounds(resolved_input, user_min_scale, user_max_scale)
+            same_file_templates = all(str(item.get("source", "")).strip() == str(resolved_input) for item in self.markup_items)
+            min_scale, max_scale = self._effective_scale_bounds(resolved_input, user_min_scale, user_max_scale) if same_file_templates else (user_min_scale, user_max_scale)
 
             config = DetectionConfig(
                 dpi=int(self.dpi_var.get()),
@@ -481,7 +882,7 @@ class PatternDetectionApp:
                 num_scales=int(self.num_scales_var.get()),
                 scope=_parse_scope(self.scope_var.get()),
                 color_sensitivity=self._selected_color_sensitivity(),
-                uniform_size_assist=self.markup_source_path == resolved_input,
+                uniform_size_assist=same_file_templates,
                 debug_artifacts=True,
             )
 
@@ -508,6 +909,13 @@ class PatternDetectionApp:
             self.last_summary = summary
             self.last_pages = load_document_pages(input_path, dpi=int(self.dpi_var.get()))
             self.last_scope = config.scope
+            self.viewer_pages = list(self.last_pages)
+            self.viewer_page_index = 0
+            self.inline_page_candidates = [list(page.candidates) for page in summary.page_results]
+            self._set_viewer_mode_values(detection_ready=True)
+            self.viewer_mode_var.set("Delete Detection")
+            self._viewer_fit()
+            self._redraw_viewer()
 
             self._append_log(f"Total markups found: {summary.total_count}")
             for class_name, class_count in summary.class_totals:
@@ -521,7 +929,7 @@ class PatternDetectionApp:
 
             messagebox.showinfo(
                 title="Detection Complete",
-                message=f"Total markups found: {summary.total_count}\nOutput: {summary.output_dir}",
+                message=f"Total markups found: {summary.total_count}\nResults are now shown in the main image view.\nOutput: {summary.output_dir}",
             )
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"ERROR: {exc}")
@@ -532,23 +940,67 @@ class PatternDetectionApp:
         try:
             if self.last_summary is None or not self.last_pages:
                 raise ValueError("Run detection first, then review the results.")
-                
-            def on_review_save(updated_summary: DetectionSummary):
-                self.last_summary = updated_summary
-                self._append_log(f"Reviewed total markups: {updated_summary.total_count}")
-                for page in updated_summary.page_results:
-                    self._append_log(f"Reviewed page {page.page_number}: {page.count} markups -> {page.annotated_path}")
-                messagebox.showinfo(
-                    title="Review Saved",
-                    message=f"Updated total markups: {updated_summary.total_count}\nOutput: {updated_summary.output_dir}",
-                )
-                
-            run_review(self.root, self.last_pages, self.last_summary, self.last_scope, on_review_save)
-            
+            self.viewer_pages = list(self.last_pages)
+            self._set_viewer_mode_values(detection_ready=True)
+            self.viewer_mode_var.set("Delete Detection")
+            if not self.inline_page_candidates:
+                self.inline_page_candidates = [list(page.candidates) for page in self.last_summary.page_results]
+            self._viewer_fit()
+            self._redraw_viewer()
+            self._append_log("Inline review enabled on main image view. Use Add/Delete Detection mode, then click Save Edits.")
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"ERROR during review: {exc}")
             self._append_log(traceback.format_exc())
             messagebox.showerror(title="Review Failed", message=str(exc))
+
+    def _save_inline_review(self) -> None:
+        try:
+            if self.last_summary is None or not self.last_pages or not self.inline_page_candidates:
+                raise ValueError("No edited detection results to save yet.")
+
+            updated_results: list[PageResult] = []
+            total_count = 0
+            for idx, (page_img, page_result, candidates) in enumerate(
+                zip(self.last_pages, self.last_summary.page_results, self.inline_page_candidates)
+            ):
+                ordered = sorted(candidates, key=lambda cand: (cand.y, cand.x))
+                total_count += len(ordered)
+                scope_polygon = None
+                if self.last_scope:
+                    h, w = page_img.shape[:2]
+                    scope_polygon = tuple((int(x * w), int(y * h)) for x, y in self.last_scope)
+                annotated = _draw_candidates(page_img, ordered, scope_polygon)
+                _imwrite_unicode(page_result.annotated_path, annotated)
+                updated_results.append(
+                    PageResult(
+                        page_number=idx + 1,
+                        count=len(ordered),
+                        annotated_path=page_result.annotated_path,
+                        candidates=tuple(ordered),
+                    )
+                )
+
+            self.last_summary = DetectionSummary(
+                total_count=total_count,
+                page_results=tuple(updated_results),
+                output_dir=self.last_summary.output_dir,
+                class_totals=self.last_summary.class_totals,
+                unclassified_count=self.last_summary.unclassified_count,
+            )
+            self.inline_page_candidates = [list(page.candidates) for page in self.last_summary.page_results]
+            self._set_viewer_mode_values(detection_ready=True)
+            self._redraw_viewer()
+            self._append_log(f"Reviewed total markups: {self.last_summary.total_count}")
+            for page in self.last_summary.page_results:
+                self._append_log(f"Reviewed page {page.page_number}: {page.count} markups -> {page.annotated_path}")
+            messagebox.showinfo(
+                title="Review Saved",
+                message=f"Updated total markups: {self.last_summary.total_count}\nOutput: {self.last_summary.output_dir}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"ERROR saving inline edits: {exc}")
+            self._append_log(traceback.format_exc())
+            messagebox.showerror(title="Save Review Failed", message=str(exc))
 
     def _clear_log(self) -> None:
         self.log.delete("0.0", tk.END)

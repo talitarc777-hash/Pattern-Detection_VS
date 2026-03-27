@@ -2826,6 +2826,7 @@ def _draw_candidates(
     scope_polygon: tuple[tuple[int, int], ...] | None = None,
 ) -> np.ndarray:
     annotated = image.copy()
+    ordered_candidates = sorted(candidates, key=lambda cand: (cand.y, cand.x))
     if scope_polygon is not None:
         pts = np.asarray(scope_polygon, dtype=np.int32).reshape((-1, 1, 2))
         cv2.polylines(annotated, [pts], isClosed=True, color=(0, 180, 0), thickness=4)
@@ -2841,7 +2842,7 @@ def _draw_candidates(
             cv2.LINE_AA,
         )
 
-    for idx, cand in enumerate(candidates, start=1):
+    for idx, cand in enumerate(ordered_candidates, start=1):
         cv2.rectangle(
             annotated,
             (cand.x, cand.y),
