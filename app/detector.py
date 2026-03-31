@@ -31,7 +31,7 @@ class DetectionConfig:
     uniform_size_assist: bool = False
     chromatic_gate_on: float = 0.45
     hue_gate_max_diff: float = 28.0
-    class_assignment_margin: float = 0.05
+    class_assignment_margin: float = 0.08
     global_non_overlap: bool = True
     exclude_unclassified: bool = True
     debug_artifacts: bool = False
@@ -593,7 +593,7 @@ def _post_filter_candidate(
             if gray_sim < 0.55:
                 row["decision"] = "gray_similarity_gate"
                 return None, row
-            acceptance_threshold = max(0.56, acceptance_threshold)
+            acceptance_threshold = max(0.62, acceptance_threshold)
 
         color_mix = 0.18 + 0.28 * color_policy.weight
         shape_mix = 0.22
@@ -632,12 +632,12 @@ def _post_filter_candidate(
         min_part = 0.0
         min_gray = 0.0
         if model.area <= 64 or min(model.width, model.height) <= 12:
-            min_shape = 0.24
-            acceptance_threshold = max(acceptance_threshold, 0.48)
+            min_shape = 0.28
+            acceptance_threshold = max(acceptance_threshold, 0.55)
         if model.component_count > 1 and model.area <= 48:
-            min_shape = max(min_shape, 0.30)
-            min_part = 0.40
-            min_gray = 0.42
+            min_shape = max(min_shape, 0.18)
+            min_part = 0.25
+            min_gray = 0.30
             if edge_sim >= 0.72 and part_sim >= 0.56:
                 min_gray = 0.36
             acceptance_threshold = max(acceptance_threshold, 0.54)
@@ -945,7 +945,7 @@ def _edge_match_candidates(
     candidates: list[_GroupCandidate] = []
 
     small_multi_part = model.component_count > 1 and model.area <= 48 and not _is_simple_blob_model(model)
-    tpl_threshold = max(0.50, cfg.match_threshold + 0.03) if small_multi_part else max(0.25, cfg.match_threshold - 0.15)
+    tpl_threshold = max(0.40, cfg.match_threshold - 0.05) if small_multi_part else max(0.25, cfg.match_threshold - 0.15)
     scales = np.linspace(_effective_min_scale(cfg, model), _effective_max_scale(cfg, model), max(6, cfg.num_scales // 2))
 
     for scale in scales:
@@ -1503,7 +1503,7 @@ def _score_group(
     if small_multi_part:
         part_sim = _part_layout_similarity(patch, model)
         gray_sim = _gray_patch_similarity(patch, model)
-        if layout_sim < 0.28 or part_sim < 0.34 or gray_sim < 0.38:
+        if layout_sim < 0.20 or part_sim < 0.26 or gray_sim < 0.30:
             return None
 
     if small_multi_part:
@@ -1844,7 +1844,7 @@ def _is_simple_blob_model(model: _TemplateModel) -> bool:
         model.area >= 12
         and min(model.width, model.height) >= 4
         and model.component_count == 1
-        and model.circularity >= 0.56
+        and model.circularity >= 0.38
         and model.solidity >= 0.55
         and 0.62 <= model.aspect_ratio <= 1.55
     )
@@ -1858,7 +1858,7 @@ def _is_dark_neutral_blob_model(model: _TemplateModel) -> bool:
         and profile.fg_lab_mean[0] <= 80.0
         and profile.fg_sat_mean <= 12.0
         and profile.fg_chroma_mean <= 6.0
-        and model.area >= 96
+        and model.area >= 20
     )
 
 
@@ -2614,7 +2614,7 @@ def _group_center_too_close(a: _GroupCandidate, b: _GroupCandidate) -> bool:
     by = b.y + b.h / 2.0
     dist = float(np.hypot(ax - bx, ay - by))
     min_dim = float(min(a.w, a.h, b.w, b.h))
-    return dist <= max(2.0, 1.25 * min_dim)
+    return dist <= max(2.0, 1.6 * min_dim)
 
 
 def _normalize_candidate_boxes(
